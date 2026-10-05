@@ -1,5 +1,6 @@
 const { launchTikTok, isTikTokLoggedIn } = require('./tiktok_browser');
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 
 const TIKTOK_FEED_URL = process.env.TIKTOK_FEED_URL || 'https://www.tiktok.com/';
@@ -190,8 +191,12 @@ async function shareAndCopyLink(page) {
         '[data-e2e="share-icon"]',
         '[data-e2e="feed-share-icon"]',
         '[data-e2e="browse-share-icon"]',
+        '[data-e2e*="share" i]',
+        '[data-e2e="video-share-container"] button',
         'button[aria-label*="Share" i]',
-        'button[aria-label*="Chia sẻ" i]'
+        'button[aria-label*="Chia sẻ" i]',
+        'button[title*="Share" i]',
+        'button[title*="Chia sẻ" i]'
       ];
 
       const candidates = [];
@@ -200,6 +205,24 @@ async function shareAndCopyLink(page) {
           const btn = el.closest('button') || el;
           if (!candidates.includes(btn)) candidates.push(btn);
         });
+      }
+
+      // Quét thêm các button lân cận trong cột action bar gần video
+      const allButtons = Array.from(document.querySelectorAll('button'));
+      const nearButtons = allButtons.filter((b) => {
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0 || r.bottom < 0 || r.top > window.innerHeight) return false;
+        return Math.abs((r.top + r.height / 2) - vMidY) < 400;
+      });
+      for (const b of nearButtons) {
+        const text = (b.innerText || '').toLowerCase();
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        const e2e = (b.getAttribute('data-e2e') || '').toLowerCase();
+        if (text.includes('chia sẻ') || text.includes('share') ||
+            aria.includes('chia sẻ') || aria.includes('share') ||
+            e2e.includes('share')) {
+          if (!candidates.includes(b)) candidates.push(b);
+        }
       }
 
       let bestBtn = null;
@@ -227,6 +250,34 @@ async function shareAndCopyLink(page) {
 
     if (!shareClicked) {
       console.log('\n   ⚠️ Không tìm thấy nút Share gần video.');
+      // Chụp ảnh lại màn hình để bạn kiểm tra nguyên nhân
+      const screenshotsDir = path.join(__dirname, 'screenshots');
+      if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
+      const shotPath = path.join(screenshotsDir, `tiktok_no_share_${Date.now()}.png`);
+      await page.screenshot({ path: shotPath }).catch(() => {});
+      console.log(`   📸 Đã chụp màn hình lưu tại: ${shotPath}`);
+
+      // In thông tin các nút đang có gần video để chẩn đoán
+      const debugButtons = await page.evaluate(() => {
+        const v = document.querySelector('video');
+        const vMidY = v ? (v.getBoundingClientRect().top + v.getBoundingClientRect().height / 2) : (window.innerHeight / 2);
+        return Array.from(document.querySelectorAll('button'))
+          .map((b) => {
+            const r = b.getBoundingClientRect();
+            return {
+              text: (b.innerText || '').trim().slice(0, 25),
+              aria: b.getAttribute('aria-label') || '',
+              dataE2e: b.getAttribute('data-e2e') || '',
+              yDiff: Math.round(Math.abs((r.top + r.height / 2) - vMidY)),
+              visible: r.width > 0 && r.height > 0
+            };
+          })
+          .filter((b) => b.visible && b.yDiff < 450)
+          .slice(0, 8);
+      }).catch(() => []);
+      if (debugButtons.length > 0) {
+        console.log('   🔍 Các nút gần video:', JSON.stringify(debugButtons));
+      }
       return false;
     }
 
