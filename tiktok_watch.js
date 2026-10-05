@@ -227,6 +227,27 @@ async function shareAndCopyLink(page) {
     }
 
     console.log('\n   📤 Đã mở hộp thoại "Chia sẻ đến", đang tìm nút "Copy"...');
+
+    // Cài hook bắt link trực tiếp khi TikTok thực hiện sao chép
+    await page.evaluate(() => {
+      window.__capturedTikTokLink = '';
+      if (!window.__tiktokClipboardHooked) {
+        window.__tiktokClipboardHooked = true;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+          navigator.clipboard.writeText = async (text) => {
+            window.__capturedTikTokLink = text;
+            return origWrite(text).catch(() => {});
+          };
+        }
+        document.addEventListener('copy', (e) => {
+          try {
+            const data = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString();
+            if (data) window.__capturedTikTokLink = data;
+          } catch (_) {}
+        }, true);
+      }
+    });
     await page.waitForTimeout(700);
 
     // 2. Tìm và click nút "Copy" / "Sao chép liên kết"
@@ -286,27 +307,59 @@ async function shareAndCopyLink(page) {
 
     // 3. Đọc link vừa copy và in log ra màn hình
     await page.waitForTimeout(600);
-    let copiedLink = await page.evaluate(async () => {
-      try {
-        const text = await navigator.clipboard.readText();
-        if (text && text.includes('tiktok.com')) return text.trim();
-      } catch (_) {}
-      return '';
-    }).catch(() => '');
 
-    // Phương án dự phòng: Lấy trực tiếp URL video từ DOM nếu clipboard bị trình duyệt chặn đọc
+    // Cách 1: Đọc từ biến hook đã bắt được khi TikTok gọi clipboard.writeText
+    let copiedLink = await page.evaluate(() => window.__capturedTikTokLink || '').catch(() => '');
+
+    // Cách 2: Đọc qua navigator.clipboard.readText (sau khi focus trang)
+    if (!copiedLink) {
+      await page.bringToFront().catch(() => {});
+      await page.evaluate(() => window.focus()).catch(() => {});
+      copiedLink = await page.evaluate(async () => {
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text && text.includes('tiktok.com')) return text.trim();
+        } catch (_) {}
+        return '';
+      }).catch(() => '');
+    }
+
+    // Cách 3: Quét tìm tất cả các thẻ link chứa /video/ trên trang và chọn thẻ gần video đang xem nhất
     if (!copiedLink) {
       copiedLink = await page.evaluate(() => {
         const videos = Array.from(document.querySelectorAll('video'));
+        let activeVideo = null;
         for (const v of videos) {
           const rect = v.getBoundingClientRect();
           const midY = rect.top + rect.height / 2;
           if (midY >= 0 && midY <= window.innerHeight && rect.height > 100) {
-            const container = v.closest('[data-e2e="recommend-list-item-container"], [class*="ItemContainer"]') || v.parentElement?.parentElement;
-            const a = container?.querySelector('a[href*="/video/"]');
-            if (a && a.href) return a.href.trim();
+            activeVideo = v;
+            break;
           }
         }
+        if (!activeVideo && videos.length > 0) activeVideo = videos[0];
+        if (!activeVideo) return '';
+
+        const vMidY = activeVideo.getBoundingClientRect().top + activeVideo.getBoundingClientRect().height / 2;
+
+        const allLinks = Array.from(document.querySelectorAll('a[href*="/video/"]'));
+        let best = '';
+        let minDiff = Infinity;
+        for (const a of allLinks) {
+          const r = a.getBoundingClientRect();
+          const diff = Math.abs((r.top + r.height / 2) - vMidY);
+          if (diff < minDiff) {
+            minDiff = diff;
+            best = a.href;
+          }
+        }
+        if (best) return best;
+
+        const inputs = Array.from(document.querySelectorAll('input'));
+        for (const inp of inputs) {
+          if (inp.value && inp.value.includes('tiktok.com')) return inp.value;
+        }
+
         return '';
       }).catch(() => '');
     }
@@ -529,6 +582,24 @@ async function main() {
   console.log('🌐 Mở trình duyệt Chrome với tài khoản TikTok đã lưu...');
   const { context, page } = await launchTikTok({ headless: false });
   await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+
+  // Cài hook bắt link ngay từ khi trang bắt đầu tải
+  await page.addInitScript(() => {
+    window.__capturedTikTokLink = '';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+      navigator.clipboard.writeText = async (text) => {
+        window.__capturedTikTokLink = text;
+        return origWrite(text).catch(() => {});
+      };
+    }
+    document.addEventListener('copy', (e) => {
+      try {
+        const text = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString();
+        if (text) window.__capturedTikTokLink = text;
+      } catch (_) {}
+    }, true);
+  }).catch(() => {});
 
   let isClosed = false;
   context.on('close', () => {
