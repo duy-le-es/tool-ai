@@ -6,6 +6,10 @@ const TIKTOK_FEED_URL = process.env.TIKTOK_FEED_URL || 'https://www.tiktok.com/'
 
 // Cấu hình thời gian xem & tương tác
 const CONFIG = {
+  // Chế độ chạy ngầm (true = ẩn cửa sổ Chrome, chỉ xem log terminal; false = hiện cửa sổ)
+  headless: process.env.TIKTOK_WATCH_HEADLESS !== undefined
+    ? (process.env.TIKTOK_WATCH_HEADLESS === 'true')
+    : (process.env.HEADLESS !== 'false'), // Mặc định true theo HEADLESS=true trong .env
   // Giới hạn số video xem (0 = không giới hạn, xem liên tục đến khi tắt)
   maxVideos: Number(process.env.TIKTOK_WATCH_MAX) || 0,
   // Thời gian xem tối thiểu mỗi video (giây)
@@ -579,8 +583,12 @@ async function main() {
   console.log('🚀 TỰ ĐỘNG XEM, THẢ TIM, COPY LINK & LƯỚT TIKTOK');
   console.log('====================================================');
 
-  console.log('🌐 Mở trình duyệt Chrome với tài khoản TikTok đã lưu...');
-  const { context, page } = await launchTikTok({ headless: false });
+  console.log(`🌐 Khởi chạy trình duyệt (${CONFIG.headless ? 'Ẩn cửa sổ / Chạy ngầm' : 'Hiện cửa sổ'})...`);
+  if (CONFIG.headless) {
+    console.log('💡 Đang chạy ở chế độ ẩn cửa sổ: Tiến trình sẽ in trực tiếp tại đây. Bấm Ctrl + C để dừng.');
+  }
+
+  const { context, page } = await launchTikTok({ headless: CONFIG.headless });
   await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
 
   // Cài hook bắt link ngay từ khi trang bắt đầu tải
@@ -602,6 +610,16 @@ async function main() {
   }).catch(() => {});
 
   let isClosed = false;
+  const cleanup = async () => {
+    if (isClosed) return;
+    isClosed = true;
+    console.log('\n👋 Đang đóng trình duyệt chạy ngầm và dừng chương trình...');
+    await context.close().catch(() => {});
+    process.exit(0);
+  };
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+
   context.on('close', () => {
     isClosed = true;
     console.log('\n👋 Trình duyệt đã được đóng. Dừng chương trình.');
