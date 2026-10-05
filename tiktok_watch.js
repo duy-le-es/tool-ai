@@ -4,16 +4,24 @@ require('dotenv').config();
 
 const TIKTOK_FEED_URL = process.env.TIKTOK_FEED_URL || 'https://www.tiktok.com/';
 
-// Cấu hình thời gian xem
+// Cấu hình thời gian xem & tương tác
 const CONFIG = {
-  // Giới hạn số video xem (0 = không giới hạn, xem đến khi bạn tắt)
+  // Giới hạn số video xem (0 = không giới hạn, xem liên tục đến khi tắt)
   maxVideos: Number(process.env.TIKTOK_WATCH_MAX) || 0,
-  // Thời gian xem tối thiểu mỗi video (giây) - tránh lướt quá nhanh
+  // Thời gian xem tối thiểu mỗi video (giây)
   minWatchSeconds: 3,
-  // Thời gian xem tối đa mỗi video (giây) - tránh bị kẹt ở video quá dài hoặc livestream
+  // Thời gian xem tối đa mỗi video (giây) - tránh kẹt ở video dài/livestream
   maxWatchSeconds: 90,
   // Tự động bật âm thanh nếu video đang bị tắt tiếng
   autoUnmute: true,
+  // Tự động thả tim khi video gần hết
+  autoLike: true,
+  // Tự động mở menu Share và bấm "Sao chép liên kết" khi video gần hết
+  autoCopyLink: true,
+  // Tỷ lệ thời lượng video để bắt đầu tương tác (0.75 = 75% video, còn khoảng 25% là hết)
+  interactionThresholdRatio: 0.75,
+  // Hoặc số giây còn lại tối đa để kích hoạt (3s trước khi hết)
+  interactionRemainingSeconds: 3.5,
 };
 
 // Đợi ngẫu nhiên trong khoảng [minMs, maxMs] để giống người thật
@@ -25,7 +33,6 @@ function randomDelay(minMs, maxMs) {
 // Tắt các popup quảng cáo / đăng nhập / thông báo nếu có
 async function dismissPopups(page) {
   try {
-    // 1. Popup "Nhận ứng dụng" hoặc "Đăng nhập"
     const closeBtns = page.locator('[data-e2e="modal-close-icon"], [aria-label="Close"], button:has-text("Không phải bây giờ"), button:has-text("Để sau"), button:has-text("Bỏ qua")');
     const count = await closeBtns.count().catch(() => 0);
     for (let i = 0; i < count; i++) {
@@ -49,6 +56,282 @@ async function ensureUnmuted(page) {
       }
     });
   } catch (_) {}
+}
+
+/**
+ * Thả tim video đang xem (nếu chưa được thả tim)
+ */
+async function likeActiveVideo(page) {
+  if (!CONFIG.autoLike) return false;
+
+  try {
+    const result = await page.evaluate(() => {
+      // 1. Tìm video đang ở giữa khung nhìn
+      const videos = Array.from(document.querySelectorAll('video'));
+      let activeVideo = null;
+      for (const v of videos) {
+        const rect = v.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        if (midY >= 0 && midY <= window.innerHeight && rect.height > 100) {
+          activeVideo = v;
+          break;
+        }
+      }
+      if (!activeVideo && videos.length > 0) activeVideo = videos[0];
+      if (!activeVideo) return { success: false, reason: 'no_video' };
+
+      const vRect = activeVideo.getBoundingClientRect();
+      const vMidY = vRect.top + vRect.height / 2;
+
+      // 2. Tìm tất cả nút Tim (Like button) trên trang
+      const likeSelectors = [
+        '[data-e2e="like-icon"]',
+        '[data-e2e="feed-like-icon"]',
+        '[data-e2e="browse-like-icon"]',
+        'button[aria-label*="Like" i]',
+        'button[aria-label*="Thích" i]'
+      ];
+
+      const candidates = [];
+      for (const sel of likeSelectors) {
+        document.querySelectorAll(sel).forEach((el) => {
+          const btn = el.closest('button') || el;
+          if (!candidates.includes(btn)) candidates.push(btn);
+        });
+      }
+
+      // Chọn nút like có vị trí trục Y gần nhất với video đang phát
+      let bestBtn = null;
+      let minDiff = Infinity;
+      for (const btn of candidates) {
+        const bRect = btn.getBoundingClientRect();
+        if (bRect.height === 0 || bRect.width === 0) continue;
+        if (bRect.bottom < 0 || bRect.top > window.innerHeight) continue;
+        const diff = Math.abs((bRect.top + bRect.height / 2) - vMidY);
+        if (diff < minDiff) {
+          minDiff = diff;
+          bestBtn = btn;
+        }
+      }
+
+      if (!bestBtn) {
+        // Fallback: double click vào giữa video để thả tim
+        const evt = new MouseEvent('dblclick', { bubbles: true, cancelable: true });
+        activeVideo.dispatchEvent(evt);
+        return { success: true, method: 'double_click' };
+      }
+
+      // Kiểm tra xem đã thả tim chưa (tránh ấn lại thành hủy tim)
+      const isAlreadyLiked = () => {
+        if (bestBtn.getAttribute('aria-pressed') === 'true') return true;
+        const svg = bestBtn.querySelector('svg');
+        if (svg) {
+          const fill = svg.getAttribute('fill') || '';
+          const style = window.getComputedStyle(svg);
+          const color = style.color || style.fill || '';
+          // Màu đỏ của TikTok: #fe2c55 / rgb(254, 44, 85)
+          if (fill.includes('fe2c55') || color.includes('254, 44, 85')) return true;
+        }
+        if (bestBtn.className && (bestBtn.className.includes('active') || bestBtn.className.includes('liked'))) return true;
+        return false;
+      };
+
+      if (isAlreadyLiked()) {
+        return { success: true, alreadyLiked: true };
+      }
+
+      bestBtn.click();
+      return { success: true, method: 'click_button' };
+    });
+
+    if (result.success) {
+      if (result.alreadyLiked) {
+        console.log('\n   ❤️ Video này đã được thả tim từ trước.');
+      } else {
+        console.log('\n   ❤️ Đã bấm THẢ TIM (Like) cho video thành công!');
+      }
+      return true;
+    }
+  } catch (err) {
+    console.log(`\n   ⚠️ Lỗi thả tim: ${err.message}`);
+  }
+  return false;
+}
+
+/**
+ * Mở nút Share và bấm nút "Sao chép liên kết" (Copy link)
+ */
+async function shareAndCopyLink(page) {
+  if (!CONFIG.autoCopyLink) return false;
+
+  try {
+    // 1. Tìm và click nút Share của video đang phát
+    const shareClicked = await page.evaluate(() => {
+      const videos = Array.from(document.querySelectorAll('video'));
+      let activeVideo = null;
+      for (const v of videos) {
+        const rect = v.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        if (midY >= 0 && midY <= window.innerHeight && rect.height > 100) {
+          activeVideo = v;
+          break;
+        }
+      }
+      if (!activeVideo && videos.length > 0) activeVideo = videos[0];
+      if (!activeVideo) return false;
+
+      const vMidY = activeVideo.getBoundingClientRect().top + activeVideo.getBoundingClientRect().height / 2;
+
+      const shareSelectors = [
+        '[data-e2e="share-icon"]',
+        '[data-e2e="feed-share-icon"]',
+        '[data-e2e="browse-share-icon"]',
+        'button[aria-label*="Share" i]',
+        'button[aria-label*="Chia sẻ" i]'
+      ];
+
+      const candidates = [];
+      for (const sel of shareSelectors) {
+        document.querySelectorAll(sel).forEach((el) => {
+          const btn = el.closest('button') || el;
+          if (!candidates.includes(btn)) candidates.push(btn);
+        });
+      }
+
+      let bestBtn = null;
+      let minDiff = Infinity;
+      for (const btn of candidates) {
+        const bRect = btn.getBoundingClientRect();
+        if (bRect.height === 0 || bRect.width === 0) continue;
+        if (bRect.bottom < 0 || bRect.top > window.innerHeight) continue;
+        const diff = Math.abs((bRect.top + bRect.height / 2) - vMidY);
+        if (diff < minDiff) {
+          minDiff = diff;
+          bestBtn = btn;
+        }
+      }
+
+      if (bestBtn) {
+        // Hover hoặc click để kích hoạt menu Share
+        bestBtn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+        bestBtn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        bestBtn.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (!shareClicked) {
+      console.log('\n   ⚠️ Không tìm thấy nút Share gần video.');
+      return false;
+    }
+
+    console.log('\n   📤 Đã mở hộp thoại "Chia sẻ đến", đang tìm nút "Copy"...');
+    await page.waitForTimeout(700);
+
+    // 2. Tìm và click nút "Copy" / "Sao chép liên kết"
+    const copyResult = await page.evaluate(() => {
+      // Tìm các phần tử chứa chữ "Copy" hoặc "Sao chép liên kết"
+      const allElements = Array.from(document.querySelectorAll('button, div, span, li, a, [role="button"], [role="menuitem"], p'));
+      const copyBtn = allElements.find((el) => {
+        const text = (el.innerText || el.textContent || '').trim();
+        const aria = el.getAttribute('aria-label') || '';
+        const title = el.getAttribute('title') || '';
+        const isMatch = /^(Copy|Sao chép liên kết|Sao chép|Copy link)$/i.test(text) ||
+                        /^(Copy|Sao chép liên kết|Copy link)$/i.test(aria) ||
+                        /^(Copy|Sao chép liên kết|Copy link)$/i.test(title);
+        if (!isMatch) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+
+      if (copyBtn) {
+        // Bấm vào nút hoặc khối bao ngoài của icon Copy
+        const clickTarget = copyBtn.closest('button, [role="button"], div[class*="item"], div[class*="action"]') || copyBtn;
+        clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        clickTarget.click();
+        return { success: true, text: copyBtn.innerText || 'Copy' };
+      }
+
+      // Fallback: tìm theo thuộc tính data-e2e
+      const byDataE2e = document.querySelector('[data-e2e="share-copy-link"]');
+      if (byDataE2e) {
+        byDataE2e.click();
+        return { success: true, text: 'data-e2e' };
+      }
+
+      return { success: false };
+    });
+
+    if (copyResult.success) {
+      console.log(`   🔗 Đã bấm "${copyResult.text || 'Copy'}" thành công!`);
+    } else {
+      console.log('   ℹ️ Đang thử bộ chọn Playwright cho nút "Copy"...');
+      const copyLocator = page.locator('button, [role="button"], div, span')
+        .filter({ hasText: /^Copy$/i })
+        .last();
+      if (await copyLocator.isVisible().catch(() => false)) {
+        await copyLocator.click({ force: true }).catch(() => {});
+        console.log('   🔗 Đã bấm nút "Copy" qua Playwright!');
+      } else {
+        // Thử click phần tử đầu tiên/thứ hai trong danh sách chia sẻ
+        const firstItem = page.locator('[role="dialog"] button, [role="dialog"] [role="button"], [role="menu"] [role="menuitem"]').nth(1);
+        if (await firstItem.isVisible().catch(() => false)) {
+          await firstItem.click({ force: true }).catch(() => {});
+          console.log('   🔗 Đã bấm mục Copy trong danh sách chia sẻ!');
+        }
+      }
+    }
+
+    // 3. Đọc link vừa copy và in log ra màn hình
+    await page.waitForTimeout(600);
+    let copiedLink = await page.evaluate(async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text && text.includes('tiktok.com')) return text.trim();
+      } catch (_) {}
+      return '';
+    }).catch(() => '');
+
+    // Phương án dự phòng: Lấy trực tiếp URL video từ DOM nếu clipboard bị trình duyệt chặn đọc
+    if (!copiedLink) {
+      copiedLink = await page.evaluate(() => {
+        const videos = Array.from(document.querySelectorAll('video'));
+        for (const v of videos) {
+          const rect = v.getBoundingClientRect();
+          const midY = rect.top + rect.height / 2;
+          if (midY >= 0 && midY <= window.innerHeight && rect.height > 100) {
+            const container = v.closest('[data-e2e="recommend-list-item-container"], [class*="ItemContainer"]') || v.parentElement?.parentElement;
+            const a = container?.querySelector('a[href*="/video/"]');
+            if (a && a.href) return a.href.trim();
+          }
+        }
+        return '';
+      }).catch(() => '');
+    }
+
+    if (copiedLink) {
+      console.log(`   📋 [LINK ĐÃ COPY]: \x1b[32m\x1b[1m${copiedLink}\x1b[0m`);
+    } else {
+      console.log('   📋 Đã bấm Copy thành công (link đã lưu vào khay nhớ tạm Clipboard)!');
+    }
+
+    // Đóng hộp thoại "Chia sẻ đến" để không che màn hình
+    await page.waitForTimeout(500);
+    const closeDialogBtn = page.locator('[role="dialog"], [class*="modal" i]')
+      .locator('[aria-label*="close" i], [aria-label*="đóng" i], button:has-text("X"), svg')
+      .first();
+    if (await closeDialogBtn.isVisible().catch(() => false)) {
+      await closeDialogBtn.click({ force: true }).catch(() => {});
+    }
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(400);
+    return true;
+  } catch (err) {
+    console.log(`\n   ⚠️ Lỗi copy link: ${err.message}`);
+  }
+  return false;
 }
 
 /**
@@ -108,15 +391,13 @@ async function watchCurrentVideo(page, videoIndex) {
 
   const duration = videoInfo.duration;
   const isFiniteDuration = Number.isFinite(duration) && duration > 0;
-  
+
   // Xác định thời gian cần xem
   let targetWatchTime;
   if (isFiniteDuration) {
-    // Xem hết video (giới hạn tối đa maxWatchSeconds nếu video quá dài)
     targetWatchTime = Math.min(duration, CONFIG.maxWatchSeconds);
     console.log(`⏱️ Thời lượng video: ${Math.round(duration)}s (Mục tiêu xem: ${Math.round(targetWatchTime)}s)`);
   } else {
-    // Có thể là Livestream hoặc video chưa load được metadata duration
     targetWatchTime = 15;
     console.log(`⏱️ Video không có thời lượng cố định (hoặc Live) -> Xem ${targetWatchTime}s`);
   }
@@ -125,6 +406,7 @@ async function watchCurrentVideo(page, videoIndex) {
   const startTime = Date.now();
   let prevCurrentTime = -1;
   let hasLooped = false;
+  let hasInteracted = false; // Đã thả tim và copy link chưa
 
   while (true) {
     await page.waitForTimeout(1000);
@@ -149,7 +431,6 @@ async function watchCurrentVideo(page, videoIndex) {
     const elapsedSeconds = (Date.now() - startTime) / 1000;
 
     if (!status) {
-      // Mất dấu video hoặc trang đang load
       if (elapsedSeconds >= targetWatchTime) break;
       continue;
     }
@@ -163,16 +444,37 @@ async function watchCurrentVideo(page, videoIndex) {
     // Hiển thị tiến trình trên 1 dòng
     process.stdout.write(`   ⏳ Đang xem: ${Math.floor(elapsedSeconds)}s / ${Math.round(targetWatchTime)}s (Tiến độ video: ${Math.floor(status.currentTime)}s)\r`);
 
+    // =========================================================================
+    // ĐIỀU KIỆN: KHI VIDEO GẦN HẾT -> THẢ TIM VÀ COPY LINK
+    // =========================================================================
+    const currentProg = isFiniteDuration ? (status.currentTime / duration) : (elapsedSeconds / targetWatchTime);
+    const remainingSec = isFiniteDuration ? (duration - status.currentTime) : (targetWatchTime - elapsedSeconds);
+
+    const isNearEnd = (currentProg >= CONFIG.interactionThresholdRatio) || (remainingSec <= CONFIG.interactionRemainingSeconds);
+
+    if (!hasInteracted && isNearEnd && elapsedSeconds >= CONFIG.minWatchSeconds) {
+      hasInteracted = true;
+      console.log(`\n🎯 Video đã phát gần hết (${Math.round(currentProg * 100)}%) -> Thực hiện tương tác:`);
+      
+      // 1. Thả tim
+      await likeActiveVideo(page);
+      await randomDelay(600, 1000);
+
+      // 2. Mở Share và bấm Copy link
+      await shareAndCopyLink(page);
+      await randomDelay(500, 800);
+    }
+
     // Điều kiện kết thúc video:
     // 1. Thuộc tính ended = true
-    // 2. Video phát gần hết (còn < 0.8s)
+    // 2. Video phát gần hết (còn < 0.6s)
     // 3. Video đã tự lặp lại (loop về 0)
     // 4. Đã xem đủ thời gian mục tiêu hoặc chạm ngưỡng tối đa
     if (status.ended) {
       console.log(`\n✅ Video đã kết thúc!`);
       break;
     }
-    if (isFiniteDuration && status.currentTime >= duration - 0.8) {
+    if (isFiniteDuration && status.currentTime >= duration - 0.6) {
       console.log(`\n✅ Đã xem hết video (${Math.round(duration)}s)!`);
       break;
     }
@@ -184,6 +486,15 @@ async function watchCurrentVideo(page, videoIndex) {
       console.log(`\n⏰ Đã xem đủ thời gian mục tiêu (${Math.round(targetWatchTime)}s)!`);
       break;
     }
+  }
+
+  // Đảm bảo nếu vì lý do gì video kết thúc quá nhanh mà chưa kịp tương tác thì tương tác ngay
+  if (!hasInteracted) {
+    hasInteracted = true;
+    console.log(`\n🎯 Video kết thúc -> Bổ sung tương tác:`);
+    await likeActiveVideo(page);
+    await randomDelay(500, 800);
+    await shareAndCopyLink(page);
   }
 
   // Nghỉ tự nhiên ngẫu nhiên 0.8s - 2s trước khi lướt tiếp
@@ -203,22 +514,21 @@ async function scrollToNextVideo(page) {
   await page.waitForTimeout(1000);
 
   // Cách 2: Kiểm tra nếu vẫn chưa chuyển video thì cuộn chuột
-  const scrollSuccess = await page.evaluate(() => {
-    // Cuộn nhẹ nếu phím mũi tên chưa kích hoạt chuyển slide
+  await page.evaluate(() => {
     window.scrollBy({ top: window.innerHeight * 0.8, behavior: 'smooth' });
-    return true;
-  }).catch(() => false);
+  }).catch(() => {});
 
   await page.waitForTimeout(1500);
 }
 
 async function main() {
   console.log('====================================================');
-  console.log('🚀 TỰ ĐỘNG XEM & LƯỚT TIKTOK (AUTO SCROLL TIKTOK)');
+  console.log('🚀 TỰ ĐỘNG XEM, THẢ TIM, COPY LINK & LƯỚT TIKTOK');
   console.log('====================================================');
 
   console.log('🌐 Mở trình duyệt Chrome với tài khoản TikTok đã lưu...');
   const { context, page } = await launchTikTok({ headless: false });
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
 
   let isClosed = false;
   context.on('close', () => {
