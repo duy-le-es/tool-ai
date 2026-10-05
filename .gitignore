@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Environment variables & sensitive credentials
+.env
+.env.local
+.env.*.local
+
+# Chrome user profiles / session cookies (CHỨA ĐĂNG NHẬP GOOGLE & TIKTOK)
+user_data/
+user_data_*/
+user_data_tiktok/
+
+# Temporary / Output media files
+downloads/
+results/
+screenshots/
+
+# Backup & scratch files
+*.bak
+test_tab_modal.js
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
