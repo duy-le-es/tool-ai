@@ -1,9 +1,11 @@
 const { launchTikTok, isTikTokLoggedIn } = require('./tiktok_browser');
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
 require('dotenv').config();
 
 const TIKTOK_FEED_URL = process.env.TIKTOK_FEED_URL || 'https://www.tiktok.com/';
+const TIKTOK_URL_PREFIX = 'https://www.tiktok.com';
 
 // Cấu hình thời gian xem & tương tác
 const CONFIG = {
@@ -291,14 +293,38 @@ async function shareAndCopyLink(page) {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
           navigator.clipboard.writeText = async (text) => {
-            window.__capturedTikTokLink = text;
+            if (text) window.__capturedTikTokLink = text;
             return origWrite(text).catch(() => {});
+          };
+        }
+        if (document.execCommand) {
+          const origExec = document.execCommand.bind(document);
+          document.execCommand = function(cmd, ...args) {
+            if (cmd === 'copy') {
+              const sel = window.getSelection()?.toString();
+              if (sel && sel.includes('tiktok.com')) window.__capturedTikTokLink = sel;
+              const el = document.activeElement;
+              if (el && (el.value || el.innerText)) {
+                const val = el.value || el.innerText;
+                if (val && val.includes('tiktok.com')) window.__capturedTikTokLink = val;
+              }
+            }
+            return origExec(cmd, ...args);
           };
         }
         document.addEventListener('copy', (e) => {
           try {
-            const data = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString();
-            if (data) window.__capturedTikTokLink = data;
+            if (e.clipboardData && e.clipboardData.setData) {
+              const origSet = e.clipboardData.setData.bind(e.clipboardData);
+              e.clipboardData.setData = function(type, val) {
+                if (val && typeof val === 'string' && val.includes('tiktok.com')) {
+                  window.__capturedTikTokLink = val;
+                }
+                return origSet(type, val);
+              };
+            }
+            const data = window.getSelection()?.toString();
+            if (data && data.includes('tiktok.com')) window.__capturedTikTokLink = data;
           } catch (_) {}
         }, true);
       }
@@ -313,9 +339,9 @@ async function shareAndCopyLink(page) {
         const text = (el.innerText || el.textContent || '').trim();
         const aria = el.getAttribute('aria-label') || '';
         const title = el.getAttribute('title') || '';
-        const isMatch = /^(Copy|Sao chép liên kết|Sao chép|Copy link)$/i.test(text) ||
-                        /^(Copy|Sao chép liên kết|Copy link)$/i.test(aria) ||
-                        /^(Copy|Sao chép liên kết|Copy link)$/i.test(title);
+        const isMatch = (text.length <= 40 && /(Copy|Sao chép liên kết|Sao chép|Copy link)/i.test(text)) ||
+                        /(Copy|Sao chép liên kết|Copy link)/i.test(aria) ||
+                        /(Copy|Sao chép liên kết|Copy link)/i.test(title);
         if (!isMatch) return false;
         const r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
@@ -331,7 +357,7 @@ async function shareAndCopyLink(page) {
       }
 
       // Fallback: tìm theo thuộc tính data-e2e
-      const byDataE2e = document.querySelector('[data-e2e="share-copy-link"]');
+      const byDataE2e = document.querySelector('[data-e2e="share-copy-link"], [data-e2e*="copy" i]');
       if (byDataE2e) {
         byDataE2e.click();
         return { success: true, text: 'data-e2e' };
@@ -340,30 +366,38 @@ async function shareAndCopyLink(page) {
       return { success: false };
     });
 
+    let copyButtonFound = copyResult.success;
     if (copyResult.success) {
       console.log(`   🔗 Đã bấm "${copyResult.text || 'Copy'}" thành công!`);
     } else {
       console.log('   ℹ️ Đang thử bộ chọn Playwright cho nút "Copy"...');
       const copyLocator = page.locator('button, [role="button"], div, span')
-        .filter({ hasText: /^Copy$/i })
+        .filter({ hasText: /^(Copy|Sao chép liên kết|Sao chép|Copy link)$/i })
         .last();
       if (await copyLocator.isVisible().catch(() => false)) {
         await copyLocator.click({ force: true }).catch(() => {});
+        copyButtonFound = true;
         console.log('   🔗 Đã bấm nút "Copy" qua Playwright!');
       } else {
-        // Thử click phần tử đầu tiên/thứ hai trong danh sách chia sẻ
-        const firstItem = page.locator('[role="dialog"] button, [role="dialog"] [role="button"], [role="menu"] [role="menuitem"]').nth(1);
-        if (await firstItem.isVisible().catch(() => false)) {
-          await firstItem.click({ force: true }).catch(() => {});
-          console.log('   🔗 Đã bấm mục Copy trong danh sách chia sẻ!');
-        }
+        console.log('   ❌ Không tìm thấy nút "Copy" / "Sao chép liên kết".');
       }
+    }
+
+    // Không đoán một mục bất kỳ trong menu là Copy. Video không có nút Copy
+    // phải được xử lý bằng cách khởi động lại toàn bộ script.
+    if (!copyButtonFound) {
+      const screenshotsDir = path.join(__dirname, 'screenshots');
+      if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
+      const shotPath = path.join(screenshotsDir, `tiktok_no_copy_button_${Date.now()}.png`);
+      await page.screenshot({ path: shotPath }).catch(() => {});
+      console.log(`   📸 Đã chụp màn hình lưu tại: ${shotPath}`);
+      return false;
     }
 
     // 3. Đọc link vừa copy và in log ra màn hình
     await page.waitForTimeout(600);
 
-    // Cách 1: Đọc từ biến hook đã bắt được khi TikTok gọi clipboard.writeText
+    // Cách 1: Đọc từ biến hook đã bắt được khi TikTok gọi copy/clipboard
     let copiedLink = await page.evaluate(() => window.__capturedTikTokLink || '').catch(() => '');
 
     // Cách 2: Đọc qua navigator.clipboard.readText (sau khi focus trang)
@@ -379,7 +413,23 @@ async function shareAndCopyLink(page) {
       }).catch(() => '');
     }
 
-    // Cách 3: Quét tìm tất cả các thẻ link chứa /video/ trên trang và chọn thẻ gần video đang xem nhất
+    // Cách 3: Quét trong dialog hoặc input của TikTok
+    if (!copiedLink) {
+      copiedLink = await page.evaluate(() => {
+        const dialogEls = Array.from(document.querySelectorAll('[role="dialog"] input, [role="dialog"] a, [role="dialog"] p, [role="dialog"] span'));
+        for (const el of dialogEls) {
+          const val = el.value || el.href || el.innerText || '';
+          if (val && val.includes('tiktok.com/@') && val.includes('/video/')) return val.trim();
+        }
+        for (const el of dialogEls) {
+          const val = el.value || el.href || el.innerText || '';
+          if (val && val.includes('tiktok.com')) return val.trim();
+        }
+        return '';
+      }).catch(() => '');
+    }
+
+    // Cách 4: Quét tìm tất cả các thẻ link chứa /video/ trên trang và chọn thẻ gần video đang xem nhất
     if (!copiedLink) {
       copiedLink = await page.evaluate(() => {
         const videos = Array.from(document.querySelectorAll('video'));
@@ -419,14 +469,13 @@ async function shareAndCopyLink(page) {
       }).catch(() => '');
     }
 
-    if (copiedLink) {
-      console.log(`   📋 [LINK ĐÃ COPY]: \x1b[32m\x1b[1m${copiedLink}\x1b[0m`);
-    } else {
-      console.log('   📋 Đã bấm Copy thành công (link đã lưu vào khay nhớ tạm Clipboard)!');
+    // Cách 5: Kiểm tra URL hiện tại nếu đang ở trang chi tiết video
+    if (!copiedLink && page.url().includes('/video/')) {
+      copiedLink = page.url();
     }
 
     // Đóng hộp thoại "Chia sẻ đến" để không che màn hình
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(400);
     const closeDialogBtn = page.locator('[role="dialog"], [class*="modal" i]')
       .locator('[aria-label*="close" i], [aria-label*="đóng" i], button:has-text("X"), svg')
       .first();
@@ -434,8 +483,20 @@ async function shareAndCopyLink(page) {
       await closeDialogBtn.click({ force: true }).catch(() => {});
     }
     await page.keyboard.press('Escape').catch(() => {});
-    await page.waitForTimeout(400);
-    return true;
+    await page.waitForTimeout(300);
+
+    if (copiedLink && copiedLink.startsWith(TIKTOK_URL_PREFIX)) {
+      console.log(`   📋 [LINK ĐÃ COPY]: \x1b[32m\x1b[1m${copiedLink}\x1b[0m`);
+      return true;
+    } else {
+      console.log(`   ❌ Link copy không hợp lệ: ${copiedLink || '(trống)'}. Link phải bắt đầu bằng ${TIKTOK_URL_PREFIX}`);
+      const screenshotsDir = path.join(__dirname, 'screenshots');
+      if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
+      const shotPath = path.join(screenshotsDir, `tiktok_no_copy_${Date.now()}.png`);
+      await page.screenshot({ path: shotPath }).catch(() => {});
+      console.log(`   📸 Đã chụp màn hình lưu tại: ${shotPath}`);
+      return false;
+    }
   } catch (err) {
     console.log(`\n   ⚠️ Lỗi copy link: ${err.message}`);
   }
@@ -569,7 +630,10 @@ async function watchCurrentVideo(page, videoIndex) {
       await randomDelay(600, 1000);
 
       // 2. Mở Share và bấm Copy link
-      await shareAndCopyLink(page);
+      const copySuccess = await shareAndCopyLink(page);
+      if (!copySuccess && CONFIG.autoCopyLink) {
+        return { success: false, restartRequired: true };
+      }
       await randomDelay(500, 800);
     }
 
@@ -602,13 +666,35 @@ async function watchCurrentVideo(page, videoIndex) {
     console.log(`\n🎯 Video kết thúc -> Bổ sung tương tác:`);
     await likeActiveVideo(page);
     await randomDelay(500, 800);
-    await shareAndCopyLink(page);
+    const copySuccess = await shareAndCopyLink(page);
+    if (!copySuccess && CONFIG.autoCopyLink) {
+      return { success: false, restartRequired: true };
+    }
   }
 
   // Nghỉ tự nhiên ngẫu nhiên 0.8s - 2s trước khi lướt tiếp
   const delayMs = Math.floor(Math.random() * 1200) + 800;
   console.log(`😴 Dừng lại ${Math.round(delayMs / 100) / 10}s rồi lướt tiếp...`);
   await page.waitForTimeout(delayMs);
+  return { success: true, restartRequired: false };
+}
+
+/**
+ * Đóng hẳn Chrome và chạy lại script. Không dùng page.reload() để tránh giữ
+ * trạng thái lỗi của video/menu Share hiện tại.
+ */
+async function restartScript(context) {
+  console.log('\n🔄 [TỰ ĐỘNG RESTART] Không có nút Copy hoặc link không đúng định dạng.');
+  console.log('🔄 Đang đóng Chrome và khởi động lại tiktok_watch.js...');
+  await context.close().catch(() => {});
+
+  const child = spawn(process.execPath, process.argv.slice(1), {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: 'inherit'
+  });
+  child.unref();
+  process.exit(0);
 }
 
 /**
@@ -648,14 +734,38 @@ async function main() {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
       navigator.clipboard.writeText = async (text) => {
-        window.__capturedTikTokLink = text;
+        if (text) window.__capturedTikTokLink = text;
         return origWrite(text).catch(() => {});
+      };
+    }
+    if (document.execCommand) {
+      const origExec = document.execCommand.bind(document);
+      document.execCommand = function(cmd, ...args) {
+        if (cmd === 'copy') {
+          const sel = window.getSelection()?.toString();
+          if (sel && sel.includes('tiktok.com')) window.__capturedTikTokLink = sel;
+          const el = document.activeElement;
+          if (el && (el.value || el.innerText)) {
+            const val = el.value || el.innerText;
+            if (val && val.includes('tiktok.com')) window.__capturedTikTokLink = val;
+          }
+        }
+        return origExec(cmd, ...args);
       };
     }
     document.addEventListener('copy', (e) => {
       try {
+        if (e.clipboardData && e.clipboardData.setData) {
+          const origSet = e.clipboardData.setData.bind(e.clipboardData);
+          e.clipboardData.setData = function(type, val) {
+            if (val && typeof val === 'string' && val.includes('tiktok.com')) {
+              window.__capturedTikTokLink = val;
+            }
+            return origSet(type, val);
+          };
+        }
         const text = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString();
-        if (text) window.__capturedTikTokLink = text;
+        if (text && text.includes('tiktok.com')) window.__capturedTikTokLink = text;
       } catch (_) {}
     }, true);
   }).catch(() => {});
@@ -700,9 +810,14 @@ async function main() {
         break;
       }
 
-      await watchCurrentVideo(page, count);
+      const result = await watchCurrentVideo(page, count);
 
       if (isClosed) break;
+
+      if (result && result.restartRequired) {
+        await restartScript(context);
+        return;
+      }
 
       await scrollToNextVideo(page);
     }

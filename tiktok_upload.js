@@ -6,7 +6,8 @@ require('dotenv').config();
 
 const TIKTOK_UPLOAD_URL = process.env.TIKTOK_UPLOAD_URL || 'https://www.tiktok.com/tiktokstudio/upload?from=creator_center';
 // Mặc định: tự bấm Đăng khi đủ thông tin (gắn được sản phẩm nếu có yêu cầu).
-// TIKTOK_AUTO_POST=false -> điền sẵn rồi để bạn tự kiểm tra và bấm Đăng (cần TIKTOK_HEADLESS=false để thấy trình duyệt)
+// TIKTOK_AUTO_POST=false -> mặc định điền sẵn rồi để bạn tự kiểm tra và bấm Đăng.
+// Khi chọn duyệt tay trên Telegram, bot tự mở cửa sổ Chrome kể cả khi TIKTOK_HEADLESS=true.
 const AUTO_POST = process.env.TIKTOK_AUTO_POST !== 'false';
 // Mặc định chạy Chrome ẩn (không mở cửa sổ), xem tiến trình qua log. TIKTOK_HEADLESS=false để mở cửa sổ xem trực tiếp.
 const HEADLESS = process.env.TIKTOK_HEADLESS !== 'false';
@@ -28,7 +29,7 @@ const TXT = {
   next: /^(Tiếp|Tiếp theo|Next)$/i,
   linkTypeLabel: /(Loại liên kết|Link type)/i,
   addProduct: /^(Thêm|Add)$/i,
-  posted: /(Your video (has been|is being) (uploaded|posted|scheduled)|Video (của bạn )?đã được (đăng|tải lên|lên lịch)|Manage your posts|Quản lý bài đăng)/i
+  posted: /(Your video (has been|is being) (uploaded|posted|scheduled)|Video (của bạn )?(đã|đang) được (đăng|tải lên|lên lịch)|Manage (your )?posts|Quản lý bài đăng|Upload another video|Tải lên video khác|View post|Xem bài đăng)/i
 };
 
 async function shot(page, dir, name) {
@@ -474,16 +475,18 @@ async function setSchedule(page, target) {
 /**
  * Đăng video lên TikTok Studio.
  * scheduleAt: Date -> dùng "Lên lịch" của TikTok để hẹn giờ đăng; bỏ trống -> đăng ngay.
- * @param {{videoPath: string, thumbnailPath?: string, caption?: string, product?: {id: string, title?: string}, scheduleAt?: Date|null, onProgress?: (msg: string) => void}} opts
+ * @param {{videoPath: string, thumbnailPath?: string, caption?: string, product?: {id: string, title?: string}, scheduleAt?: Date|null, autoPost?: boolean, onProgress?: (msg: string) => void}} opts
  */
-async function uploadToTikTok({ videoPath, thumbnailPath, caption = '', product = null, scheduleAt = null, onProgress = () => {} }) {
+async function uploadToTikTok({ videoPath, thumbnailPath, caption = '', product = null, scheduleAt = null, autoPost = AUTO_POST, onProgress = () => {} }) {
   if (!videoPath || !fs.existsSync(videoPath)) throw new Error(`Không tìm thấy video: ${videoPath}`);
   if (!/\.(mp4|mov|webm)$/i.test(videoPath)) throw new Error(`File video phải là .mp4/.mov/.webm, đang là: ${path.basename(videoPath)}`);
   const screenshotsDir = path.join(__dirname, 'screenshots');
   fs.mkdirSync(screenshotsDir, { recursive: true });
 
-  console.error(`🚀 Mở Chrome TikTok (${HEADLESS ? 'chạy ẩn' : 'hiện cửa sổ'}, ${AUTO_POST ? 'tự đăng' : 'không tự đăng'})...`);
-  const { context, page } = await launchTikTok({ headless: HEADLESS });
+  // Duyệt tay phải hiện cửa sổ để người dùng có thể bấm Đăng, dù cấu hình mặc định chạy ẩn.
+  const headless = autoPost ? HEADLESS : false;
+  console.error(`🚀 Mở Chrome TikTok (${headless ? 'chạy ẩn' : 'hiện cửa sổ'}, ${autoPost ? 'tự đăng' : 'chờ duyệt tay'})...`);
+  const { context, page } = await launchTikTok({ headless });
   let closedByUser = false;
   context.on('close', () => { closedByUser = true; });
 
@@ -585,9 +588,10 @@ async function uploadToTikTok({ videoPath, thumbnailPath, caption = '', product 
       ? `Không gắn được sản phẩm nên bot KHÔNG đăng. ${productError}`
       : scheduleError ? `Không hẹn giờ đăng được nên bot KHÔNG đăng. ${scheduleError}` : null;
 
-    // 5a. Chạy ẩn mà không đủ điều kiện tự đăng -> không có cửa sổ để duyệt tay, đóng luôn và báo qua log
-    if (HEADLESS && (!AUTO_POST || blockReason)) {
-      const reason = blockReason || 'TIKTOK_AUTO_POST=false nên bot không bấm Đăng';
+    // 5a. Chạy ẩn mà không đủ điều kiện tự đăng -> không có cửa sổ để duyệt tay, đóng luôn và báo qua log.
+    // (Chế độ duyệt tay luôn mở cửa sổ ở trên, nên chỉ còn trường hợp lỗi bắt buộc.)
+    if (headless && (!autoPost || blockReason)) {
+      const reason = blockReason || 'đang ở chế độ duyệt tay nên bot không bấm Đăng';
       // Không gửi onProgress: lý do đã nằm trong message trả về (tránh gửi trùng 2 tin)
       console.error(`⛔ ${reason}. Xem ảnh: ${filledShot}`);
       await context.close();
@@ -599,12 +603,12 @@ async function uploadToTikTok({ videoPath, thumbnailPath, caption = '', product 
       };
     }
 
-    // 5b. Có cửa sổ trình duyệt (TIKTOK_HEADLESS=false) + chế độ duyệt hoặc gắn sản phẩm lỗi:
+    // 5b. Có cửa sổ trình duyệt + chế độ duyệt hoặc gắn sản phẩm lỗi:
     // để bạn tự kiểm tra, bấm Đăng rồi đóng trình duyệt
-    if (!AUTO_POST || blockReason) {
+    if (!autoPost || blockReason) {
       if (blockReason) onProgress(`⚠️ ${blockReason}`);
-      console.error('⏸️ TIKTOK_AUTO_POST chưa bật -> đợi bạn kiểm tra và tự bấm Đăng, rồi đóng trình duyệt');
-      onProgress('⏸️ Đã điền sẵn video + caption + ảnh bìa trên TikTok. Vào máy kiểm tra, tự bấm ĐĂNG rồi đóng trình duyệt (tối đa 30 phút).');
+      console.error('⏸️ Chế độ duyệt tay -> đợi bạn kiểm tra và tự bấm Đăng, rồi đóng trình duyệt');
+      onProgress('⏸️ Đã điền sẵn video + caption + ảnh bìa trên TikTok. Vào máy kiểm tra, tự bấm ĐĂNG/LÊN LỊCH rồi đóng trình duyệt (tối đa 30 phút).');
       const reviewDeadline = Date.now() + REVIEW_TIMEOUT_MS;
       while (!closedByUser && Date.now() < reviewDeadline) await new Promise((r) => setTimeout(r, 2000));
       if (!closedByUser) await context.close();
@@ -620,18 +624,34 @@ async function uploadToTikTok({ videoPath, thumbnailPath, caption = '', product 
     console.error(scheduledFor ? `🚀 Bấm Lên lịch (đăng lúc ${fmtVN(scheduledFor)})...` : '🚀 Bấm Đăng...');
     await postBtn.click();
     let posted = false;
-    const postDeadline = Date.now() + 2 * 60000;
+    const postDeadline = Date.now() + 4 * 60000;
+    let lastLogTime = 0;
     while (Date.now() < postDeadline) {
       const postNow = page.getByRole('button', { name: TXT.postNow }).first();
       if (await postNow.isVisible().catch(() => false)) await postNow.click().catch(() => {});
-      if (/\/tiktokstudio\/content/.test(page.url()) || await page.getByText(TXT.posted).first().isVisible().catch(() => false)) {
+
+      const isContentUrl = /\/tiktokstudio\/content/.test(page.url());
+      const hasPostedText = await page.getByText(TXT.posted).first().isVisible().catch(() => false);
+      const hasSuccessBtn = await page.getByRole('button', {
+        name: /^(Quản lý bài đăng|Manage posts|Tải lên video khác|Upload another video|Xem bài đăng|View post)$/i
+      }).first().isVisible().catch(() => false);
+
+      if (isContentUrl || hasPostedText || hasSuccessBtn) {
         posted = true;
         break;
       }
+
+      if (Date.now() - lastLogTime > 15000) {
+        lastLogTime = Date.now();
+        console.error('⏳ Đang chờ TikTok hoàn tất đăng (máy chủ đang xử lý video)...');
+      }
+
       await page.waitForTimeout(2000);
     }
 
-    const doneMsg = scheduledFor ? `Đã lên lịch đăng video TikTok lúc ${fmtVN(scheduledFor)}!` : 'Đã đăng video lên TikTok!';
+    const doneMsg = scheduledFor
+      ? `Đã lên lịch đăng video TikTok lúc ${fmtVN(scheduledFor)}!`
+      : 'Đã đăng video lên TikTok!';
     const unknownMsg = `Đã bấm ${scheduledFor ? 'Lên lịch' : 'Đăng'} nhưng chưa xác nhận được là thành công, kiểm tra lại TikTok Studio`;
     console.error(posted ? `🎉 ${doneMsg}` : `❓ ${unknownMsg}`);
     const screenshotPath = await shot(page, screenshotsDir, posted ? 'posted' : 'post_unknown');

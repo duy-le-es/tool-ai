@@ -8,7 +8,7 @@ require('dotenv').config();
 const FLOW_TOOL_URL = process.env.FLOW_TOOL_URL || 'https://flow.google.com/project/856dd52d-7081-4b09-8a04-b32e7b5b6a0d/tool/0f719f8f-3aa3-4c8a-8b73-edb5ecd9fa7b';
 const USER_DATA_DIR = path.join(__dirname, 'user_data');
 const HEADLESS = process.env.HEADLESS === 'true';
-const RENDER_TIMEOUT_MIN = Number(process.env.RENDER_TIMEOUT_MIN) || 20;
+const RENDER_TIMEOUT_MIN = Number(process.env.RENDER_TIMEOUT_MIN) || 10;
 const FLOW_LOAD_TIMEOUT_MS = (Number(process.env.FLOW_LOAD_TIMEOUT_SEC) || 120) * 1000;
 
 // Giao diện tool chạy trong iframe sandbox (flow-applet-runner). Trang chính của Flow cũng có 1 bản sao
@@ -203,7 +203,14 @@ async function runAutomation(imagePaths, { onProgress = () => {} } = {}) {
     viewport: { width: 1440, height: 900 }
   });
 
-  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+  // Không tái sử dụng tab Flow từ phiên trước: popup, iframe hoặc trạng thái lỗi cũ
+  // có thể còn giữ lại trong tab Chrome persistent. Cookie đăng nhập vẫn được giữ nguyên.
+  const stalePages = context.pages();
+  if (stalePages.length) {
+    console.error(`🧹 Đang đóng ${stalePages.length} tab cũ của Google Flow...`);
+    await Promise.all(stalePages.map((stalePage) => stalePage.close().catch(() => {})));
+  }
+  const page = await context.newPage();
   // Ghi lại lý do nếu trình duyệt / trang bị đóng giữa chừng để báo lỗi rõ ràng
   let closingByBot = false;
   page.on('crash', () => {
@@ -287,13 +294,24 @@ async function runAutomation(imagePaths, { onProgress = () => {} } = {}) {
       await page.waitForTimeout(4000);
     }
 
-    console.error('🎬 Đang tìm nút "SẢN XUẤT TỰ ĐỘNG"...');
-    const produceBtn = await findInFrames(page, ['SẢN XUẤT TỰ ĐỘNG']);
-    if (!produceBtn) throw new Error('Không tìm thấy nút "SẢN XUẤT TỰ ĐỘNG" trong applet');
+    // Flow đã đổi CTA từ "SẢN XUẤT TỰ ĐỘNG" sang
+    // "SO SÁNH MẪU & SẢN XUẤT AN TOÀN". Giữ nhãn cũ làm dự phòng
+    // để automation hoạt động với cả giao diện chưa được cập nhật.
+    const produceButtonLabels = [
+      'SO SÁNH MẪU & SẢN XUẤT AN TOÀN',
+      'So sánh mẫu & sản xuất an toàn',
+      'SẢN XUẤT TỰ ĐỘNG',
+      'Sản xuất tự động'
+    ];
+    console.error('🎬 Đang tìm nút "SO SÁNH MẪU & SẢN XUẤT AN TOÀN"...');
+    const produceBtn = await findInFrames(page, produceButtonLabels);
+    if (!produceBtn) {
+      throw new Error('Không tìm thấy nút "SO SÁNH MẪU & SẢN XUẤT AN TOÀN" (hoặc "SẢN XUẤT TỰ ĐỘNG") trong applet');
+    }
     await produceBtn.scrollIntoViewIfNeeded();
     await produceBtn.click();
-    console.error('🚀 ĐÃ BẤM SẢN XUẤT TỰ ĐỘNG THÀNH CÔNG!');
-    onProgress(`🎬 Đã bấm Sản Xuất Tự Động, đang đợi video render (tối đa ${RENDER_TIMEOUT_MIN} phút)...`);
+    console.error('🚀 ĐÃ BẤM NÚT SẢN XUẤT THÀNH CÔNG!');
+    onProgress(`🎬 Đã bấm nút Sản xuất, đang đợi video render (tối đa ${RENDER_TIMEOUT_MIN} phút)...`);
 
     const outDir = path.join(__dirname, 'results', `result_${Date.now()}`);
     const files = await waitAndCollectResults(page, outDir, {

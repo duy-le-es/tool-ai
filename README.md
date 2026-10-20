@@ -5,8 +5,10 @@ Hệ thống tự động hóa tạo video sản phẩm bằng Google Flow AI (T
 ## Tính năng chính
 
 - **Telegram Bot**: Nhận link sản phẩm / hình ảnh từ người dùng, quản lý hàng đợi và tài khoản Google Flow.
+- **Chọn phong cách video trên Telegram**: Sau khi gửi ảnh/thông tin sản phẩm, chọn một trong bốn mood: **Điện ảnh / Sản phẩm**, **Viral / Sống động**, **Chill / Nhẹ nhàng** hoặc **Hài hước / Trẻ trung**. Lựa chọn được áp dụng trên giao diện Google Flow mới trước khi sản xuất video.
 - **Google Flow Automation**: Tự động tải ảnh sản phẩm, thực hiện Magic Fill, sinh video, tải về thumbnail, caption và video hoàn chỉnh.
-- **TikTok Studio Upload**: Tự động mở trình duyệt tải video lên TikTok Studio, điền tiêu đề/caption, tìm kiếm và gắn liên kết TikTok Shop Affiliate, đổi ảnh bìa.
+- **TikTok Studio Upload**: Khi hẹn giờ, bot tự mở trình duyệt tải video lên TikTok Studio, điền tiêu đề/caption, tìm kiếm và gắn liên kết TikTok Shop Affiliate, đổi ảnh bìa.
+- **Đăng theo lịch khi cần**: Mặc định bot chỉ gửi video qua Telegram và không mở TikTok Studio. Chỉ khi chọn **Hẹn giờ đăng TikTok**, bot mới tải video lên và dùng lịch đăng của TikTok; bot không thay đổi quyền xem video.
 
 ## Cài đặt
 
@@ -40,3 +42,13 @@ Hệ thống tự động hóa tạo video sản phẩm bằng Google Flow AI (T
   ```bash
   node bot.js
   ```
+
+- **Dọn cache, file tải về và du lieu phien dang nhap**:
+  ```bash
+  npm run clear-cache
+  ```
+  Lenh tren chi hien thi cac thu muc se xoa. De xoa that, chay:
+  ```bash
+  npm run clear-cache -- --yes
+  ```
+  Thao tac nay xoa `user_data*`, nen can dang nhap lai Google va TikTok sau do.

@@ -6,6 +6,10 @@ require('dotenv').config();
 const TIKTOK_STUDIO_URL = process.env.TIKTOK_STUDIO_URL || 'https://www.tiktok.com/tiktokstudio/content';
 // Profile riêng cho TikTok, tách khỏi profile Google Flow (user_data)
 const TIKTOK_USER_DATA_DIR = path.join(__dirname, 'user_data_tiktok');
+// TikTok có thể cache rất nhiều segment video. 150 MB là đủ để trang hoạt động
+// bình thường mà không để profile lớn dần sau mỗi lần chạy.
+const DISK_CACHE_SIZE_BYTES = Number(process.env.TIKTOK_DISK_CACHE_SIZE_BYTES) || 150 * 1024 * 1024;
+const MEDIA_CACHE_SIZE_BYTES = Number(process.env.TIKTOK_MEDIA_CACHE_SIZE_BYTES) || 32 * 1024 * 1024;
 
 function cleanStaleLocks(dir) {
   const lockNames = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
@@ -32,10 +36,15 @@ async function launchTikTok({ headless = false } = {}) {
       '--no-restore-session-state',
       '--disable-session-crashed-bubble',
       '--hide-crash-restore-bubble',
-      // Gập máy / tắt màn hình không làm Chrome giảm tốc trang (xem automation.js)
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--disable-background-timer-throttling'
+      `--disk-cache-size=${DISK_CACHE_SIZE_BYTES}`,
+      `--media-cache-size=${MEDIA_CACHE_SIZE_BYTES}`,
+      // Chỉ cần các cờ này nếu phải chạy khi cửa sổ bị che/tắt màn hình.
+      // Bật mặc định khiến Chrome không hạ tài nguyên khi chạy nền.
+      ...(process.env.TIKTOK_KEEP_ACTIVE === 'true' ? [
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling'
+      ] : [])
     ],
     ignoreDefaultArgs: ['--enable-automation'],
     viewport: { width: 1440, height: 900 },

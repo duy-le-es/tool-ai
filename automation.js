@@ -8,6 +8,7 @@ require('dotenv').config();
 const FLOW_TOOL_URL = process.env.FLOW_TOOL_URL || 'https://flow.google.com/project/856dd52d-7081-4b09-8a04-b32e7b5b6a0d/tool/0f719f8f-3aa3-4c8a-8b73-edb5ecd9fa7b';
 const USER_DATA_DIR = path.join(__dirname, 'user_data');
 const HEADLESS = process.env.HEADLESS === 'true';
+// Video Flow có thể cần lâu hơn 10 phút; vẫn cho phép ghi đè trong .env khi cần.
 const RENDER_TIMEOUT_MIN = Number(process.env.RENDER_TIMEOUT_MIN) || 20;
 const FLOW_LOAD_TIMEOUT_MS = (Number(process.env.FLOW_LOAD_TIMEOUT_SEC) || 120) * 1000;
 
@@ -75,8 +76,216 @@ async function findInFrames(page, texts, { timeout = 30000 } = {}) {
   return null;
 }
 
+// getByText() thường trả về <span> bên trong CTA. Lấy phần tử điều khiển gần
+// nhất để click đúng button thay vì chỉ coi việc click vào text không lỗi là đã
+// khởi tạo tác vụ. (Một số phiên bản Flow có handler ở div[role=button].)
+async function actionControl(textLocator) {
+  const handle = await textLocator.evaluateHandle((el) => el.closest(
+    'button, [role="button"], input[type="button"], input[type="submit"]'
+  ) || el);
+  return handle.asElement() || textLocator;
+}
+
+async function productionUiState(page, control) {
+  const controlState = await control.evaluate((el) => ({
+    connected: el.isConnected,
+    visible: (() => {
+      const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+    })(),
+    disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
+    text: (el.innerText || el.textContent || '').trim(),
+    className: String(el.className || '')
+  })).catch(() => ({ connected: false, visible: false, disabled: false, text: '', className: '' }));
+
+  // Những nhãn này chỉ xuất hiện sau khi CTA đã được Flow nhận và bắt đầu đổi
+  // sang màn hình/trạng thái sản xuất. Dò ở mọi frame vì Flow có thể thay iframe.
+  const startedLabels = /^(đang sản xuất|đang tạo video|đang render|đang xử lý|tạo video|xem kết quả|tải ngay|download video)$/i;
+  let startedLabel = '';
+  for (const frame of page.frames()) {
+    const label = frame.getByText(startedLabels).first();
+    if (await label.isVisible().catch(() => false)) {
+      startedLabel = (await label.textContent().catch(() => '')).trim();
+      break;
+    }
+  }
+  return { ...controlState, startedLabel };
+}
+
+// Khi bấm "SẢN XUẤT VIDEO" thất bại, applet hiện một khung viền đỏ bên dưới
+// nút (thường nằm ngoài màn hình) thay vì đổi trạng thái. So sánh chữ trong
+// mọi frame trước/sau khi bấm để đọc được thông báo lỗi đó và dừng sớm, thay
+// vì ngồi chờ render tới hết RENDER_TIMEOUT_MIN.
+const PRODUCTION_ERROR_RE = /(lỗi|error|thất bại|failed|không thể|không đủ|hết (lượt|credit|hạn mức|quota)|quota|rate limit|vi phạm|policy|unsafe|bị chặn|blocked|thử lại|try again)/i;
+// Trang kết quả có các mục cam kết như "KHÔNG VI PHẠM NHÃN HIỆU ✓" hay
+// "...bảo vệ tài khoản khỏi quét vi phạm..." -> không phải lỗi.
+const PRODUCTION_SAFE_RE = /(✓|✔|không vi phạm|an toàn|bảo vệ|không in logo|không dính)/i;
+
+async function appletTextLines(page) {
+  const lines = new Set();
+  for (const frame of page.frames()) {
+    const text = await frame.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+    for (const line of String(text).split('\n')) {
+      const t = line.trim();
+      if (t) lines.add(t);
+    }
+  }
+  return lines;
+}
+
+async function newAppletLines(page, baseline) {
+  return [...await appletTextLines(page)].filter((line) => !baseline.has(line));
+}
+
+// Trả về thông báo lỗi mới xuất hiện (nếu có) và chụp lại khung lỗi.
+async function detectProductionError(page, baseline, screenshotsDir) {
+  const errors = (await newAppletLines(page, baseline)).filter((line) => PRODUCTION_ERROR_RE.test(line) && !PRODUCTION_SAFE_RE.test(line));
+  if (errors.length === 0) return null;
+  for (const frame of page.frames()) {
+    const loc = frame.getByText(errors[0], { exact: true }).first();
+    if (await loc.isVisible().catch(() => false)) {
+      await loc.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+      break;
+    }
+  }
+  const screenshotPath = path.join(screenshotsDir, `produce_error_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath }).catch(() => {});
+  return { message: errors.join(' | ').slice(0, 500), screenshotPath };
+}
+
+// Magic Fill điền mô tả bất đồng bộ. CTA đã có trên màn hình từ trước nhưng vẫn
+// bị disabled trong lúc đó, nên tuyệt đối không click chỉ vì đã tìm thấy text.
+async function waitForEnabledProduction(page, produceBtn, screenshotsDir, timeout = 120000) {
+  const control = await actionControl(produceBtn);
+  const deadline = Date.now() + timeout;
+  let state = await productionUiState(page, control);
+  while (Date.now() < deadline) {
+    state = await productionUiState(page, control);
+    const enabled = state.connected && state.visible && !state.disabled && await isClickable(control);
+    if (enabled) {
+      console.error('✅ Nút "SẢN XUẤT VIDEO" đã sáng và sẵn sàng để bấm');
+      return control;
+    }
+    await page.waitForTimeout(500);
+  }
+
+  const screenshotPath = path.join(screenshotsDir, `produce_still_disabled_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath }).catch(() => {});
+  throw new Error(
+    `Nút "SẢN XUẤT VIDEO" vẫn chưa sẵn sàng sau ${Math.round(timeout / 1000)} giây ` +
+    `(visible=${state.visible}, disabled=${state.disabled}; xem ${screenshotPath}).`
+  );
+}
+
+// click() resolve thành công chỉ chứng minh Playwright đã gửi chuột, không chứng
+// minh React/Flow nhận request. Không chuyển sang vòng chờ render cho đến khi CTA
+// biến mất/bị khóa hoặc UI hiện tín hiệu sản xuất/kết quả.
+async function clickAndConfirmProduction(page, produceBtn, screenshotsDir, timeout = 20000) {
+  const control = await waitForEnabledProduction(page, produceBtn, screenshotsDir);
+  await control.scrollIntoViewIfNeeded();
+  if (!await isClickable(control)) throw new Error('Nút "SẢN XUẤT VIDEO" đang bị phần tử khác che');
+
+  const before = await productionUiState(page, control);
+  const baseline = await appletTextLines(page);
+  await page.screenshot({ path: path.join(screenshotsDir, `produce_before_click_${Date.now()}.png`) }).catch(() => {});
+  await control.click();
+
+  const failIfError = async () => {
+    const err = await detectProductionError(page, baseline, screenshotsDir);
+    if (err) throw new Error(`Flow báo lỗi sau khi bấm "SẢN XUẤT VIDEO": ${err.message} (xem ${err.screenshotPath})`);
+  };
+
+  const deadline = Date.now() + timeout;
+  let current = before;
+  let confirmed = false;
+  while (Date.now() < deadline) {
+    await failIfError();
+    current = await productionUiState(page, control);
+    if (!current.connected || !current.visible || current.disabled || current.startedLabel) {
+      console.error(`✅ Flow đã nhận lệnh sản xuất${current.startedLabel ? ` (${current.startedLabel})` : ''}`);
+      confirmed = true;
+      break;
+    }
+    await page.waitForTimeout(250);
+  }
+
+  if (!confirmed) {
+    const screenshotPath = path.join(screenshotsDir, `produce_not_confirmed_${Date.now()}.png`);
+    await page.screenshot({ path: screenshotPath }).catch(() => {});
+    const added = (await newAppletLines(page, baseline)).slice(0, 10).join(' | ');
+    throw new Error(
+      'Đã gửi click tới nút "SẢN XUẤT VIDEO" nhưng Flow không đổi sang trạng thái sản xuất sau 20 giây ' +
+      `(CTA vẫn hiển thị=${current.visible}, disabled=${current.disabled}; chữ mới trên UI: ${added || 'không có'}; xem ${screenshotPath}).`
+    );
+  }
+
+  // CTA có thể bị React render lại (connected=false) hoặc khóa thoáng qua rồi
+  // mới hiện khung lỗi -> tiếp tục canh lỗi thêm một lúc trước khi chờ render.
+  const settleDeadline = Date.now() + 10000;
+  while (Date.now() < settleDeadline) {
+    await failIfError();
+    await page.waitForTimeout(500);
+  }
+  const added = await newAppletLines(page, baseline);
+  if (added.length) console.error(`ℹ️ Chữ mới trên UI sau khi bấm: ${added.slice(0, 10).join(' | ')}`);
+  return { checkError: failIfError };
+}
+
+// UI mới hiển thị "BỘ SƯU TẬP SẢN PHẨM (n/3)". Đây là nguồn xác nhận duy nhất
+// rằng ảnh đã được gắn vào tool, thay vì chỉ dựa vào việc hộp chọn asset đã đóng.
+async function productCollectionCount(page) {
+  const counter = /bộ\s+sưu\s+tập\s+sản\s+phẩm\s*\(\s*(\d+)\s*\/\s*\d+\s*\)/i;
+  for (const frame of [...page.frames().filter((f) => f !== page.mainFrame()), page.mainFrame()]) {
+    const label = frame.getByText(counter).first();
+    if (!await label.isVisible().catch(() => false)) continue;
+    const text = await label.textContent().catch(() => '');
+    const match = String(text).match(counter);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+async function waitForEnabledConfirmButton(page, picker, screenshotsDir, timeout = 60000) {
+  const confirmBtn = picker.getByRole('button', {
+    name: /^(Add media|Thêm nội dung nghe nhìn|Thêm phương tiện|Select|Insert|Use|Done|Add|Chọn|Thêm|Xong)$/i
+  }).first();
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const ready = await confirmBtn.isVisible().catch(() => false) &&
+      await confirmBtn.isEnabled().catch(() => false) &&
+      await isClickable(confirmBtn);
+    if (ready) return confirmBtn;
+    await page.waitForTimeout(500);
+  }
+  const screenshotPath = path.join(screenshotsDir, `picker_not_ready_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath }).catch(() => {});
+  throw new Error(`Ảnh upload chưa sẵn sàng để thêm sau ${timeout / 1000}s (xem ${screenshotPath})`);
+}
+
+async function waitForCollectionIncrease(page, previousCount, screenshotsDir, timeout = 30000) {
+  // Một số bản Flow không render bộ đếm bằng text. Không đoán thành công trong
+  // trường hợp đó: trả về null để log cảnh báo, còn trường hợp có bộ đếm phải tăng.
+  if (previousCount === null) return null;
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const currentCount = await productCollectionCount(page);
+    if (currentCount !== null && currentCount > previousCount) return currentCount;
+    await page.waitForTimeout(500);
+  }
+  const screenshotPath = path.join(screenshotsDir, `collection_not_updated_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath }).catch(() => {});
+  throw new Error(`Ảnh chưa xuất hiện trong Bộ sưu tập sản phẩm (vẫn ${previousCount}/3; xem ${screenshotPath})`);
+}
+
 // Bấm "Thêm ảnh" trong applet -> Flow mở hộp chọn asset -> "Upload media" -> chọn ảnh vừa tải -> hộp đóng.
 async function uploadViaAssetPicker(page, imagePath, screenshotsDir) {
+  const collectionBefore = await productCollectionCount(page);
+  if (collectionBefore === null) {
+    console.warn('⚠️ Không đọc được bộ đếm Bộ sưu tập sản phẩm; sẽ chỉ xác minh nút Add media khả dụng.');
+  } else {
+    console.error(`🖼️ Bộ sưu tập hiện có: ${collectionBefore}/3 ảnh`);
+  }
   const addPhotoBtn = await findInFrames(page, ['THÊM ẢNH', 'Thêm ảnh']);
   if (!addPhotoBtn) throw new Error('Không tìm thấy nút "THÊM ẢNH" trong applet');
   await addPhotoBtn.click();
@@ -110,17 +319,14 @@ async function uploadViaAssetPicker(page, imagePath, screenshotsDir) {
   const asset = await waitForUploadedAsset(page, picker, imagePath, rowLabels);
   await asset.scrollIntoViewIfNeeded().catch(() => {});
   await asset.click({ force: true }).catch(() => asset.click());
-  await page.waitForTimeout(1000);
-  await page.screenshot({ path: path.join(screenshotsDir, `picker_selected_${Date.now()}.png`) });
-  console.error('🖱️ Đã chọn ảnh vừa upload (xem screenshots/picker_selected_*.png)');
+  console.error('🖱️ Đã chọn ảnh vừa upload; đợi Flow xử lý thumbnail và mở nút Add media...');
 
-  // Bấm "Add media" để gắn ảnh vào applet
-  const confirmBtn = picker.getByRole('button', { name: /^(Add media|Thêm nội dung nghe nhìn|Thêm phương tiện|Select|Insert|Use|Done|Add|Chọn|Thêm|Xong)$/i }).first();
-  await confirmBtn.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
-  if (await confirmBtn.isVisible().catch(() => false)) {
-    await confirmBtn.click();
-    console.error('➕ Đã bấm "Add media"');
-  }
+  // Ảnh chụp lỗi trước đây cho thấy nút còn mờ (disabled) và thumbnail vẫn xoay.
+  // Chỉ bấm khi nút thực sự enabled, không dùng việc hộp dialog đóng làm dấu hiệu thành công.
+  const confirmBtn = await waitForEnabledConfirmButton(page, picker, screenshotsDir);
+  await page.screenshot({ path: path.join(screenshotsDir, `picker_ready_${Date.now()}.png`) });
+  await confirmBtn.click();
+  console.error('➕ Đã bấm "Add media" khi nút đã sẵn sàng');
 
   try {
     await picker.waitFor({ state: 'hidden', timeout: 15000 });
@@ -128,8 +334,12 @@ async function uploadViaAssetPicker(page, imagePath, screenshotsDir) {
     await page.screenshot({ path: path.join(screenshotsDir, `picker_stuck_${Date.now()}.png`) });
     throw new Error('Hộp chọn asset không đóng sau khi chọn ảnh (xem screenshots/picker_stuck_*.png)');
   }
-  console.error('✅ Đã gắn ảnh sản phẩm vào applet!');
-  await page.waitForTimeout(2000);
+  const collectionAfter = await waitForCollectionIncrease(page, collectionBefore, screenshotsDir);
+  if (collectionAfter === null) {
+    console.warn('⚠️ Hộp asset đã đóng, nhưng không có bộ đếm để xác nhận số ảnh.');
+  } else {
+    console.error(`✅ Đã gắn ảnh sản phẩm vào applet (${collectionAfter}/3 ảnh)!`);
+  }
 }
 
 // Tìm asset vừa upload theo TÊN FILE. Tên file được đặt ngắn (vd "sp_k3j9x2", xem makeShortUploadCopy)
@@ -177,9 +387,21 @@ function cleanErrorMessage(msg) {
   return text.length > 500 ? text.slice(0, 500) + '…' : text;
 }
 
+function flowPageClosedError(page) {
+  const reason = page.__closeReason || 'tab Flow tự đóng khi đang tải applet';
+  return new Error(`Tab Google Flow đã bị đóng giữa chừng (${reason}). Bot sẽ thử mở lại một phiên mới.`);
+}
+
+const FLOW_STYLE_LABELS = {
+  cinematic: ['ĐIỆN ẢNH / SẢN PHẨM', 'Điện ảnh / Sản phẩm', 'ĐIỆN ẢNH'],
+  viral: ['VIRAL / SỐNG ĐỘNG', 'Viral / Sống động', 'VIRAL'],
+  chill: ['CHILL / NHẸ NHÀNG', 'Chill / Nhẹ nhàng', 'CHILL'],
+  funny: ['HÀI HƯỚC / TRẺ TRUNG', 'Hài hước / Trẻ trung', 'HÀI HƯỚC']
+};
+
 // imagePaths: 1 đường dẫn hoặc mảng nhiều ảnh — tất cả thuộc CÙNG MỘT sản phẩm, chạy trong 1 flow duy nhất
 // userDataDir / flowUrl: hồ sơ Chrome + link tool Flow của tài khoản Google được chọn (xem accounts.js)
-async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = USER_DATA_DIR, flowUrl = FLOW_TOOL_URL } = {}) {
+async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDataDir = USER_DATA_DIR, flowUrl = FLOW_TOOL_URL, videoStyle = 'cinematic' } = {}) {
   imagePaths = Array.isArray(imagePaths) ? imagePaths : [imagePaths];
   if (imagePaths.length === 0) throw new Error('Không có ảnh sản phẩm nào');
   for (const imagePath of imagePaths) {
@@ -210,7 +432,14 @@ async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = 
     viewport: { width: 1440, height: 900 }
   });
 
-  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+  // Không tái sử dụng tab Flow từ phiên trước: popup, iframe hoặc trạng thái lỗi cũ
+  // có thể còn giữ lại trong tab Chrome persistent. Cookie đăng nhập vẫn được giữ nguyên.
+  const stalePages = context.pages();
+  if (stalePages.length) {
+    console.error(`🧹 Đang đóng ${stalePages.length} tab cũ của Google Flow...`);
+    await Promise.all(stalePages.map((stalePage) => stalePage.close().catch(() => {})));
+  }
+  const page = await context.newPage();
   // Ghi lại lý do nếu trình duyệt / trang bị đóng giữa chừng để báo lỗi rõ ràng
   let closingByBot = false;
   page.on('crash', () => {
@@ -237,6 +466,9 @@ async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = 
   await context.addInitScript(installCaptureHooks);
   await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
 
+  // Chỉ thử lại tự động khi tab mất lúc khởi tạo. Sau khi applet đã sẵn sàng,
+  // việc chạy lại có thể upload/gửi yêu cầu sản xuất trùng.
+  let safeToRetryPageClose = true;
   try {
     console.error(`🌐 Truy cập Google Flow: ${flowUrl}`);
     // Không dùng 'networkidle': Flow luôn giữ kết nối nền nên có lúc không bao giờ "idle" -> timeout.
@@ -275,6 +507,7 @@ async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = 
       throw new Error(`Sau ${FLOW_LOAD_TIMEOUT_MS / 1000}s vẫn chưa thấy nút "THÊM ẢNH" — applet chưa tải xong hoặc mạng chậm`);
     }
     console.error('✅ Applet đã sẵn sàng');
+    safeToRetryPageClose = false;
 
     for (const [i, imagePath] of imagePaths.entries()) {
       console.error(`📤 Đang tải ảnh sản phẩm ${i + 1}/${imagePaths.length}: ${imagePath}`);
@@ -287,25 +520,53 @@ async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = 
       }
     }
 
-    const magicFillBtn = await findInFrames(page, ['MAGIC FILL AI', 'MAGIC FILL'], { timeout: 5000 });
+    // UI mới dùng "TỰ ĐỘNG ĐIỀN TỪ ẢNH"; các nhãn Magic Fill được giữ để
+    // không làm hỏng tool Flow của những tài khoản chưa nhận UI mới.
+    const magicFillBtn = await findInFrames(page, [
+      'TỰ ĐỘNG ĐIỀN TỪ ẢNH', 'Tự động điền từ ảnh', 'MAGIC FILL AI', 'MAGIC FILL'
+    ], { timeout: 5000 });
     if (magicFillBtn) {
-      console.error('✨ Đang bấm nút MAGIC FILL AI...');
+      console.error('✨ Đang bấm nút "TỰ ĐỘNG ĐIỀN TỪ ẢNH"...');
       await magicFillBtn.click();
       await page.waitForTimeout(4000);
     }
 
-    console.error('🎬 Đang tìm nút "SẢN XUẤT TỰ ĐỘNG"...');
-    const produceBtn = await findInFrames(page, ['SẢN XUẤT TỰ ĐỘNG']);
-    if (!produceBtn) throw new Error('Không tìm thấy nút "SẢN XUẤT TỰ ĐỘNG" trong applet');
-    await produceBtn.scrollIntoViewIfNeeded();
-    await produceBtn.click();
-    console.error('🚀 ĐÃ BẤM SẢN XUẤT TỰ ĐỘNG THÀNH CÔNG!');
-    onProgress(`🎬 Đã bấm Sản Xuất Tự Động, đang đợi video render (tối đa ${RENDER_TIMEOUT_MIN} phút)...`);
+    // Chọn mood đã được người dùng chọn trên Telegram. Bỏ qua khi Flow chưa
+    // hiện nhóm nút này để vẫn tương thích với giao diện cũ.
+    const styleLabels = FLOW_STYLE_LABELS[videoStyle] || FLOW_STYLE_LABELS.cinematic;
+    const styleBtn = await findInFrames(page, styleLabels, { timeout: 5000 });
+    if (styleBtn) {
+      console.error(`🎵 Đang chọn phong cách video: ${videoStyle}`);
+      await styleBtn.click();
+      await page.waitForTimeout(500);
+    } else {
+      console.warn(`⚠️ Không thấy nút phong cách "${videoStyle}" trên Flow; dùng lựa chọn mặc định của giao diện.`);
+    }
+
+    // UI hiện tại dùng "SẢN XUẤT VIDEO". Các nhãn cũ chỉ là dự phòng cho
+    // tool Flow chưa được cập nhật, không phải CTA ưu tiên.
+    const produceButtonLabels = [
+      'SẢN XUẤT VIDEO',
+      'Sản xuất video',
+      'SO SÁNH MẪU & SẢN XUẤT AN TOÀN',
+      'So sánh mẫu & sản xuất an toàn',
+      'SẢN XUẤT TỰ ĐỘNG',
+      'Sản xuất tự động'
+    ];
+    console.error('🎬 Đang tìm nút "SẢN XUẤT VIDEO"...');
+    const produceBtn = await findInFrames(page, produceButtonLabels);
+    if (!produceBtn) {
+      throw new Error('Không tìm thấy nút "SẢN XUẤT VIDEO" trong applet');
+    }
+    const { checkError } = await clickAndConfirmProduction(page, produceBtn, screenshotsDir);
+    console.error('🚀 ĐÃ XÁC NHẬN FLOW BẮT ĐẦU SẢN XUẤT!');
+    onProgress(`🎬 Đã bấm nút Sản xuất, đang đợi video render (tối đa ${RENDER_TIMEOUT_MIN} phút)...`);
 
     const outDir = path.join(__dirname, 'results', `result_${Date.now()}`);
     const files = await waitAndCollectResults(page, outDir, {
       timeoutMs: RENDER_TIMEOUT_MIN * 60000,
-      onProgress
+      onProgress,
+      checkError
     });
 
     const screenshotPath = path.join(screenshotsDir, `result_${Date.now()}.png`);
@@ -325,7 +586,11 @@ async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = 
     };
 
   } catch (error) {
-    console.error('❌ Lỗi tự động hóa:', error);
+    // Playwright thường chỉ báo "Target page ... has been closed" tại lệnh kế tiếp.
+    // Chuẩn hoá lỗi này để hàng đợi có thể nhận ra một lần đóng tab tạm thời và thử lại.
+    const pageClosedBeforeCleanup = page.isClosed();
+    const actualError = pageClosedBeforeCleanup ? flowPageClosedError(page) : error;
+    console.error('❌ Lỗi tự động hóa:', actualError);
     const screenshotPath = path.join(screenshotsDir, `error_${Date.now()}.png`);
     try {
       await page.screenshot({ path: screenshotPath });
@@ -333,10 +598,29 @@ async function runAutomation(imagePaths, { onProgress = () => {}, userDataDir = 
     await context.close();
     return {
       success: false,
-      message: `Lỗi: ${cleanErrorMessage(error.message)}`,
-      screenshotPath
+      message: `Lỗi: ${cleanErrorMessage(actualError.message)}`,
+      screenshotPath,
+      // Chỉ retry khi tab/context đã thật sự mất, không retry lỗi UI/upload vì có thể tạo thao tác trùng.
+      retryablePageClose: pageClosedBeforeCleanup && safeToRetryPageClose
     };
   }
+}
+
+// Flow đôi khi đóng tab vừa mở trong lúc applet khởi tạo (đặc biệt sau một lượt tải file
+// hoặc khi Chrome khôi phục phiên cũ). Một lượt thử lại với context/profile mới thường đủ;
+// không lặp vô hạn để tránh chạy trùng một yêu cầu thật sự lỗi.
+async function runAutomation(imagePaths, options = {}) {
+  const first = await runAutomationAttempt(imagePaths, options);
+  if (first.success || !first.retryablePageClose) return first;
+
+  console.warn('🔄 Tab Flow đóng khi khởi tạo; tự mở lại một phiên mới (lần 2/2)...');
+  options.onProgress?.('⚠️ Tab Google Flow vừa tự đóng khi tải. Bot đang tự mở lại một phiên mới...');
+  const second = await runAutomationAttempt(imagePaths, options);
+  if (!second.success && second.retryablePageClose) {
+    const detail = cleanErrorMessage(second.message).replace(/^Lỗi:\s*/i, '');
+    second.message = 'Lỗi: Google Flow đã tự đóng tab ở cả hai lần mở. Hãy kiểm tra Chrome không bị đóng, hồ sơ Google không bị dùng bởi tiến trình khác, rồi thử lại.\n' + detail;
+  }
+  return second;
 }
 
 module.exports = { runAutomation };

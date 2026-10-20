@@ -43,7 +43,7 @@ async function processQueue() {
   isProcessing = true;
 
   const item = queue.shift();
-  const { ctx, imagePaths, product, scheduleAt } = item;
+  const { ctx, imagePaths, product, videoStyle, scheduleAt } = item;
   const account = item.account || listGoogleAccounts()[0];
 
   try {
@@ -57,7 +57,8 @@ async function processQueue() {
     const result = await runAutomation(imagePaths, {
       onProgress: progressNotifier(ctx),
       userDataDir: account.dir,
-      flowUrl: account.flowUrl
+      flowUrl: account.flowUrl,
+      videoStyle
     });
     activeProfileDir = null;
 
@@ -92,8 +93,17 @@ async function processQueue() {
       await ctx.replyWithPhoto({ source: result.screenshotPath }, { caption: '📸 Ảnh chụp màn hình trạng thái' });
     }
 
-    // Bước 5: đăng lên TikTok Studio
-    if (result.success && files.video) {
+    // Mặc định chỉ gửi video qua Telegram. TikTok chỉ được mở khi người dùng
+    // đã chọn giờ hẹn; lúc đó TikTok tự đăng đúng theo lịch đã chọn.
+    if (result.success && files.video && !scheduleAt) {
+      if (videoSent) {
+        const freedMB = cleanupData(imagePaths);
+        console.log(`🧹 Đã gửi video Telegram và dọn dữ liệu tác vụ (giải phóng ${freedMB.toFixed(1)}MB)`);
+        await ctx.reply('✅ Video đã gửi qua Telegram. Bot không tải lên TikTok và đã dọn file video vừa tạo.');
+      } else {
+        await ctx.reply('⚠️ Chưa dọn file video vì gửi Telegram không thành công.');
+      }
+    } else if (result.success && files.video) {
       console.log(scheduleAt
         ? `📱 Bắt đầu tải video lên TikTok Studio và hẹn giờ đăng lúc ${formatTime(scheduleAt)}...`
         : '📱 Bắt đầu đăng video lên TikTok Studio...');
@@ -101,6 +111,7 @@ async function processQueue() {
         videoPath: files.video,
         product,
         scheduleAt,
+        autoPost: true,
         thumbnailPath: files.thumbnail,
         caption: files.captionText || '',
         onProgress: progressNotifier(ctx)
@@ -163,7 +174,28 @@ function cleanupData(jobImagePaths) {
 }
 
 function newDraft() {
-  return { images: [], pendingDownloads: 0, menuTimer: null, scheduledTime: null, awaitingCustomTime: false, product: null };
+  return {
+    images: [], pendingDownloads: 0, menuTimer: null, scheduledTime: null,
+    awaitingCustomTime: false, product: null, videoStyle: 'cinematic'
+  };
+}
+
+// Các giá trị này được dùng cho cả Telegram và automation Flow. Không dùng text UI
+// làm dữ liệu lưu vì Flow có thể rút gọn nhãn tùy kích thước màn hình.
+const VIDEO_STYLES = {
+  cinematic: { label: '🎬 Điện ảnh / Sản phẩm', shortLabel: 'Điện ảnh / Sản phẩm' },
+  viral: { label: '⚡ Viral / Sống động', shortLabel: 'Viral / Sống động' },
+  chill: { label: '🛡️ Chill / Nhẹ nhàng', shortLabel: 'Chill / Nhẹ nhàng' },
+  funny: { label: '🎉 Hài hước / Trẻ trung', shortLabel: 'Hài hước / Trẻ trung' }
+};
+
+function videoStyleLine(style) {
+  return `🎵 Phong cách video: **${VIDEO_STYLES[style]?.shortLabel || VIDEO_STYLES.cinematic.shortLabel}**`;
+}
+
+function styleButton(style, selectedStyle) {
+  const option = VIDEO_STYLES[style];
+  return Markup.button.callback(`${selectedStyle === style ? '✅ ' : ''}${option.label}`, `set_style:${style}`);
 }
 
 // Escape ký tự Markdown (tên sản phẩm hay có _ [ ] làm lỗi parse_mode Markdown)
@@ -265,20 +297,29 @@ function buildControlKeyboard(draft) {
   draft.view = 'menu';
   const timeText = draft.scheduledTime
     ? `⏰ Hẹn giờ đăng TikTok: ${formatTime(draft.scheduledTime)} (video vẫn được tạo ngay khi bấm Start)`
-    : '⚡ Đăng TikTok ngay khi tạo xong video';
+    : '📥 Video sẽ được gửi qua Telegram khi tạo xong (không tải lên TikTok)';
 
   return {
     caption: `📦 **THÔNG TIN TÁC VỤ:**\n` +
              `🖼️ Ảnh sản phẩm: ${draft.images.length} ảnh (cùng 1 sản phẩm)\n` +
              `${productLine(draft.product)}\n` +
+             `${videoStyleLine(draft.videoStyle)}\n` +
              `${creditLine(draft)}\n` +
              `➕ Gửi thêm ảnh để bổ sung cho sản phẩm này, bấm Hủy để làm sản phẩm mới\n` +
              `⏱️ ${timeText}\n\n` +
-             `👉 Chọn cài đặt thời gian bên dưới hoặc bấm **START** để tiến hành:`,
+             `👉 Chỉ khi chọn **Hẹn giờ đăng TikTok**, bot mới tự tải và lên lịch đăng.`,
     keyboard: Markup.inlineKeyboard([
       [
-        Markup.button.callback('⚡ Đăng ngay', 'set_run_now'),
+        Markup.button.callback('📥 Chỉ nhận video Telegram', 'set_run_now'),
         Markup.button.callback('⏰ Hẹn giờ đăng TikTok', 'menu_schedule')
+      ],
+      [
+        styleButton('cinematic', draft.videoStyle),
+        styleButton('viral', draft.videoStyle)
+      ],
+      [
+        styleButton('chill', draft.videoStyle),
+        styleButton('funny', draft.videoStyle)
       ],
       [
         Markup.button.callback('🔄 Cập nhật credit', 'refresh_credits')
@@ -298,7 +339,7 @@ bot.start((ctx) => {
     `👋 Chào mừng bạn đến với Bot tự động hóa Google Flow!\n\n` +
     `👉 **Quy trình sử dụng:**\n` +
     `1. Gửi ảnh sản phẩm vào đây (có thể dán link sản phẩm TikTok Shop vào chú thích ảnh, hoặc gửi link riêng).\n` +
-    `2. Chọn thời điểm đăng TikTok (Đăng ngay hoặc Hẹn giờ đăng). Video luôn được tạo ngay khi bấm Start.\n` +
+    `2. Mặc định bot chỉ gửi video qua Telegram. Nếu muốn bot đăng TikTok, hãy chọn giờ hẹn. Video luôn được tạo ngay khi bấm Start.\n` +
     `3. Bấm nút **[🚀 BẮT ĐẦU CHẠY (START)]** để kích hoạt!`
   );
 });
@@ -372,9 +413,19 @@ bot.action('set_run_now', async (ctx) => {
   draft.scheduledTime = null;
   draft.awaitingCustomTime = false;
 
-  await ctx.answerCbQuery('Đã chuyển sang chế độ: Đăng TikTok ngay khi tạo xong video');
+  await ctx.answerCbQuery('Bot sẽ chỉ gửi video qua Telegram, không tải lên TikTok');
   const menu = buildControlKeyboard(draft);
   await ctx.editMessageText(menu.caption, { parse_mode: 'Markdown', ...menu.keyboard });
+});
+
+bot.action(/^set_style:(cinematic|viral|chill|funny)$/, async (ctx) => {
+  const draft = userDrafts.get(ctx.chat.id);
+  if (!draft) return ctx.answerCbQuery('Không tìm thấy tác vụ. Vui lòng gửi ảnh mới!');
+
+  draft.videoStyle = ctx.match[1];
+  await ctx.answerCbQuery(`Đã chọn: ${VIDEO_STYLES[draft.videoStyle].shortLabel}`);
+  const menu = buildControlKeyboard(draft);
+  await ctx.editMessageText(menu.caption, { parse_mode: 'Markdown', ...menu.keyboard }).catch(() => {});
 });
 
 bot.action('refresh_credits', async (ctx) => {
@@ -417,7 +468,7 @@ bot.action('menu_schedule', async (ctx) => {
   );
 });
 
-function setDelayMinutes(ctx, minutes) {
+async function setDelayMinutes(ctx, minutes) {
   const chatId = ctx.chat.id;
   const draft = userDrafts.get(chatId);
   if (!draft) return ctx.answerCbQuery('Không tìm thấy ảnh. Vui lòng gửi ảnh mới!');
@@ -425,9 +476,9 @@ function setDelayMinutes(ctx, minutes) {
   draft.scheduledTime = new Date(Date.now() + minutes * 60 * 1000);
   draft.awaitingCustomTime = false;
 
-  ctx.answerCbQuery(`Đã hẹn giờ đăng TikTok sau ${minutes} phút`);
+  await ctx.answerCbQuery(`Đã hẹn giờ đăng TikTok sau ${minutes} phút`);
   const menu = buildControlKeyboard(draft);
-  ctx.editMessageText(menu.caption, { parse_mode: 'Markdown', ...menu.keyboard });
+  await ctx.editMessageText(menu.caption, { parse_mode: 'Markdown', ...menu.keyboard });
 }
 
 bot.action('sched_15m', (ctx) => setDelayMinutes(ctx, 15));
@@ -559,10 +610,14 @@ async function startJob(ctx, draft, account) {
   const scheduleAt = draft.scheduledTime && draft.scheduledTime.getTime() > Date.now() ? draft.scheduledTime : null;
   const accText = `👤 Tài khoản Google Flow: ${escapeMd(accountName(account))}`;
   const queued = isProcessing ? '\n⏳ Bot đang tạo video khác, tác vụ này sẽ chạy sau khi xong.' : '';
-  await ctx.reply(scheduleAt
-    ? `🚀 **BẮT ĐẦU TẠO VIDEO!**\n${accText}\n📅 Video sẽ được hẹn giờ đăng TikTok lúc: **${formatTime(scheduleAt)}**.${queued}`
-    : `🚀 **BẮT ĐẦU TẠO VIDEO!** (tạo xong sẽ đăng TikTok luôn)\n${accText}${queued}`, { parse_mode: 'Markdown' });
-  queue.push({ ctx, imagePaths: draftImagePaths(draft), product: draft.product, scheduleAt, account });
+  const postText = scheduleAt
+    ? `📅 Video sẽ được hẹn giờ đăng TikTok lúc: **${formatTime(scheduleAt)}**.`
+    : '📥 Tạo xong bot chỉ gửi video qua Telegram; bot không tải lên TikTok.';
+  await ctx.reply(`🚀 **BẮT ĐẦU TẠO VIDEO!**\n${accText}\n${postText}${queued}`, { parse_mode: 'Markdown' });
+  queue.push({
+    ctx, imagePaths: draftImagePaths(draft), product: draft.product, videoStyle: draft.videoStyle, scheduleAt,
+    account
+  });
   processQueue();
 }
 
@@ -572,6 +627,19 @@ bot.action('action_cancel', async (ctx) => {
   userDrafts.delete(chatId);
   await ctx.answerCbQuery('Đã hủy tác vụ.');
   await ctx.editMessageText('❌ Tác vụ đã được hủy. Bạn có thể gửi ảnh mới bất kỳ lúc nào.');
+});
+
+// Telegraf ném lại mọi lỗi từ handler nếu không có error handler. Callback Telegram
+// chỉ hợp lệ trong thời gian ngắn; khi Telegram gửi lại update cũ sau lúc bot restart,
+// answerCallbackQuery sẽ trả 400. Ghi log lỗi đó nhưng tuyệt đối không làm bot dừng.
+bot.catch((error, ctx) => {
+  const description = error?.response?.description || error?.message || String(error);
+  const updateId = ctx?.update?.update_id || 'unknown';
+  if (/query is too old|response timeout expired|query ID is invalid/i.test(description)) {
+    console.warn(`⚠️ Bỏ qua callback đã hết hạn (update ${updateId}): ${description}`);
+    return;
+  }
+  console.error(`❌ Lỗi khi xử lý Telegram update ${updateId}:`, error);
 });
 
 bot.launch().then(() => {

@@ -252,14 +252,29 @@ async function clickAndCaptureCopy(page, frame, button) {
   return page.evaluate(() => navigator.clipboard.readText()).catch(() => null);
 }
 
+// Tool UI mới không nhất thiết còn dòng "Checklist đăng TikTok Shop". Dò trực
+// tiếp nút tải video, còn marker cũ chỉ giữ làm tín hiệu bổ sung.
 const RESULT_MARKER = /checklist đăng tiktok shop/i;
-const BTN_VIDEO = /^\s*tải ngay\s*$/i;
+const BTN_VIDEO = /^\s*(tải ngay|tải video|download video|download)\s*$/i;
 const BTN_CAPTION = /^\s*copy\s*$/i;
 const BTN_THUMB = /^\s*lưu ảnh\s*$/i;
 
+async function findResultFrame(page) {
+  const byLegacyMarker = await findFrameWith(page, RESULT_MARKER);
+  if (byLegacyMarker) return byLegacyMarker;
+
+  // Sau khi render, UI cũ và mới đều có CTA tải video. Không phụ thuộc vào
+  // một đoạn chữ mô tả cố định vốn rất dễ đổi theo phiên bản Flow.
+  for (const frame of [...page.frames().filter((f) => f !== page.mainFrame()), page.mainFrame()]) {
+    const button = frame.getByText(BTN_VIDEO).first();
+    if (await button.isVisible().catch(() => false)) return frame;
+  }
+  return null;
+}
+
 // Đợi trang kết quả, rồi tải video + thumbnail + caption về outDir.
 // Nút "TẢI NGAY" có thể hiện sẵn trước khi video render xong, nên cứ thử tải lại định kỳ tới khi được file.
-async function waitAndCollectResults(page, outDir, { timeoutMs, onProgress = () => {} }) {
+async function waitAndCollectResults(page, outDir, { timeoutMs, onProgress = () => {}, checkError = async () => {} }) {
   fs.mkdirSync(outDir, { recursive: true });
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
@@ -271,11 +286,14 @@ async function waitAndCollectResults(page, outDir, { timeoutMs, onProgress = () 
 
   while (Date.now() < deadline && !files.video) {
     assertAlive(page);
-    frame = await findFrameWith(page, RESULT_MARKER);
+    frame = await findResultFrame(page);
+    // Lỗi render (khung đỏ trên applet) -> dừng ngay, không chờ hết timeout.
+    // Đã có trang kết quả thì bỏ qua: chữ trên checklist dễ bị bắt nhầm là lỗi.
+    if (!frame) await checkError();
     if (frame) {
       const btn = frame.getByText(BTN_VIDEO).first();
       if (await btn.isVisible().catch(() => false)) {
-        console.error('📥 Thử tải video (TẢI NGAY)...');
+        console.error('📥 Đã thấy nút tải video, đang tải...');
         files.video = await clickAndCaptureFile(page, frame, btn, path.join(outDir, 'video')).catch((e) => {
           if (page.isClosed()) throw browserClosedError(page);
           console.error('⚠️ Tải video chưa được:', e.message.split('\n')[0]);
@@ -293,7 +311,11 @@ async function waitAndCollectResults(page, outDir, { timeoutMs, onProgress = () 
     await page.waitForTimeout(15000).catch(() => assertAlive(page));
   }
 
-  if (!files.video) throw new Error(`Hết ${Math.round(timeoutMs / 60000)} phút mà chưa tải được video`);
+  if (!files.video) {
+    const screenshotPath = path.join(outDir, 'render_timeout.png');
+    await page.screenshot({ path: screenshotPath }).catch(() => {});
+    throw new Error(`Hết ${Math.round(timeoutMs / 60000)} phút mà chưa tải được video (đã lưu trạng thái tại ${screenshotPath})`);
+  }
   console.error(`🎞️ Đã tải video: ${files.video}`);
 
   const captionBtn = frame.getByText(BTN_CAPTION).first();
