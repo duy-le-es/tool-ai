@@ -7,7 +7,11 @@ const { uploadToTikTok } = require('./tiktok_upload');
 const { findTikTokUrl, parseProductLink, shortProductName } = require('./product_link');
 const { getFlowCredits, waitCreditsIdle } = require('./google_credits');
 const { listGoogleAccounts, getGoogleAccount } = require('./accounts');
+const { killPreviousInstances } = require('./kill_previous');
 require('dotenv').config();
+
+// Chỉ giữ lại bản bot mới nhất: dừng các bot cũ (tránh lỗi 409 Conflict của Telegram) và Chrome của chúng
+killPreviousInstances();
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -43,7 +47,7 @@ async function processQueue() {
   isProcessing = true;
 
   const item = queue.shift();
-  const { ctx, imagePaths, product, videoStyle, scheduleAt } = item;
+  const { ctx, imagePaths, product, videoStyle, videoDuration, scheduleAt } = item;
   const account = item.account || listGoogleAccounts()[0];
 
   try {
@@ -58,7 +62,8 @@ async function processQueue() {
       onProgress: progressNotifier(ctx),
       userDataDir: account.dir,
       flowUrl: account.flowUrl,
-      videoStyle
+      videoStyle,
+      videoDuration
     });
     activeProfileDir = null;
 
@@ -176,26 +181,43 @@ function cleanupData(jobImagePaths) {
 function newDraft() {
   return {
     images: [], pendingDownloads: 0, menuTimer: null, scheduledTime: null,
-    awaitingCustomTime: false, product: null, videoStyle: 'cinematic'
+    awaitingCustomTime: false, product: null, videoStyle: 'cinematic',
+    videoDuration: '20s'
   };
 }
 
 // Các giá trị này được dùng cho cả Telegram và automation Flow. Không dùng text UI
 // làm dữ liệu lưu vì Flow có thể rút gọn nhãn tùy kích thước màn hình.
 const VIDEO_STYLES = {
-  cinematic: { label: '🎬 Điện ảnh / Sản phẩm', shortLabel: 'Điện ảnh / Sản phẩm' },
-  viral: { label: '⚡ Viral / Sống động', shortLabel: 'Viral / Sống động' },
+  cinematic: { label: '🎬 Điện ảnh / Sang trọng', shortLabel: 'Điện ảnh / Sang trọng' },
+  viral: { label: '⚡ Viral / Sôi động', shortLabel: 'Viral / Sôi động' },
   chill: { label: '🛡️ Chill / Nhẹ nhàng', shortLabel: 'Chill / Nhẹ nhàng' },
   funny: { label: '🎉 Hài hước / Trẻ trung', shortLabel: 'Hài hước / Trẻ trung' }
+};
+
+const VIDEO_DURATIONS = {
+  '16s': { label: '⚡ 16s (TikTok chuẩn)', shortLabel: '16s (TikTok chuẩn)' },
+  '20s': { label: '🎬 20s (2 phân đoạn)', shortLabel: '20s (2 phân đoạn)' },
+  '10s': { label: '⏱️ 10s (Rút gọn)', shortLabel: '10s (Rút gọn)' },
+  '26s': { label: '📽️ 26s (Chi tiết)', shortLabel: '26s (Chi tiết)' }
 };
 
 function videoStyleLine(style) {
   return `🎵 Phong cách video: **${VIDEO_STYLES[style]?.shortLabel || VIDEO_STYLES.cinematic.shortLabel}**`;
 }
 
+function videoDurationLine(duration) {
+  return `⏱️ Thời lượng video: **${VIDEO_DURATIONS[duration]?.shortLabel || VIDEO_DURATIONS['20s'].shortLabel}**`;
+}
+
 function styleButton(style, selectedStyle) {
   const option = VIDEO_STYLES[style];
   return Markup.button.callback(`${selectedStyle === style ? '✅ ' : ''}${option.label}`, `set_style:${style}`);
+}
+
+function durationButton(duration, selectedDuration) {
+  const option = VIDEO_DURATIONS[duration];
+  return Markup.button.callback(`${selectedDuration === duration ? '✅ ' : ''}${option.label}`, `set_duration:${duration}`);
 }
 
 // Escape ký tự Markdown (tên sản phẩm hay có _ [ ] làm lỗi parse_mode Markdown)
@@ -304,6 +326,7 @@ function buildControlKeyboard(draft) {
              `🖼️ Ảnh sản phẩm: ${draft.images.length} ảnh (cùng 1 sản phẩm)\n` +
              `${productLine(draft.product)}\n` +
              `${videoStyleLine(draft.videoStyle)}\n` +
+             `${videoDurationLine(draft.videoDuration)}\n` +
              `${creditLine(draft)}\n` +
              `➕ Gửi thêm ảnh để bổ sung cho sản phẩm này, bấm Hủy để làm sản phẩm mới\n` +
              `⏱️ ${timeText}\n\n` +
@@ -312,6 +335,14 @@ function buildControlKeyboard(draft) {
       [
         Markup.button.callback('📥 Chỉ nhận video Telegram', 'set_run_now'),
         Markup.button.callback('⏰ Hẹn giờ đăng TikTok', 'menu_schedule')
+      ],
+      [
+        durationButton('16s', draft.videoDuration),
+        durationButton('20s', draft.videoDuration)
+      ],
+      [
+        durationButton('10s', draft.videoDuration),
+        durationButton('26s', draft.videoDuration)
       ],
       [
         styleButton('cinematic', draft.videoStyle),
@@ -424,6 +455,16 @@ bot.action(/^set_style:(cinematic|viral|chill|funny)$/, async (ctx) => {
 
   draft.videoStyle = ctx.match[1];
   await ctx.answerCbQuery(`Đã chọn: ${VIDEO_STYLES[draft.videoStyle].shortLabel}`);
+  const menu = buildControlKeyboard(draft);
+  await ctx.editMessageText(menu.caption, { parse_mode: 'Markdown', ...menu.keyboard }).catch(() => {});
+});
+
+bot.action(/^set_duration:(10s|16s|20s|26s)$/, async (ctx) => {
+  const draft = userDrafts.get(ctx.chat.id);
+  if (!draft) return ctx.answerCbQuery('Không tìm thấy tác vụ. Vui lòng gửi ảnh mới!');
+
+  draft.videoDuration = ctx.match[1];
+  await ctx.answerCbQuery(`Đã chọn thời lượng: ${VIDEO_DURATIONS[draft.videoDuration].shortLabel}`);
   const menu = buildControlKeyboard(draft);
   await ctx.editMessageText(menu.caption, { parse_mode: 'Markdown', ...menu.keyboard }).catch(() => {});
 });
@@ -615,7 +656,8 @@ async function startJob(ctx, draft, account) {
     : '📥 Tạo xong bot chỉ gửi video qua Telegram; bot không tải lên TikTok.';
   await ctx.reply(`🚀 **BẮT ĐẦU TẠO VIDEO!**\n${accText}\n${postText}${queued}`, { parse_mode: 'Markdown' });
   queue.push({
-    ctx, imagePaths: draftImagePaths(draft), product: draft.product, videoStyle: draft.videoStyle, scheduleAt,
+    ctx, imagePaths: draftImagePaths(draft), product: draft.product,
+    videoStyle: draft.videoStyle, videoDuration: draft.videoDuration, scheduleAt,
     account
   });
   processQueue();

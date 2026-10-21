@@ -1,7 +1,7 @@
 const { launchTikTok, isTikTokLoggedIn } = require('./tiktok_browser');
+const { killPreviousInstances } = require('./kill_previous');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
 require('dotenv').config();
 
 const TIKTOK_FEED_URL = process.env.TIKTOK_FEED_URL || 'https://www.tiktok.com/';
@@ -15,6 +15,11 @@ const CONFIG = {
     : (process.env.HEADLESS !== 'false'), // Mặc định true theo HEADLESS=true trong .env
   // Giới hạn số video xem (0 = không giới hạn, xem liên tục đến khi tắt)
   maxVideos: Number(process.env.TIKTOK_WATCH_MAX) || 0,
+  // Cứ sau N video thì đóng Chrome và mở lại để giải phóng RAM (0 = không bao giờ).
+  // Tab TikTok lướt vô hạn giữ lại DOM/bộ nhớ của mọi video đã xem nên RAM tăng dần.
+  recycleEvery: process.env.TIKTOK_WATCH_RECYCLE_EVERY !== undefined
+    ? Number(process.env.TIKTOK_WATCH_RECYCLE_EVERY) || 0
+    : 30,
   // Thời gian xem tối thiểu mỗi video (giây)
   minWatchSeconds: 3,
   // Thời gian xem tối đa mỗi video (giây) - tránh kẹt ở video dài/livestream
@@ -680,24 +685,6 @@ async function watchCurrentVideo(page, videoIndex) {
 }
 
 /**
- * Đóng hẳn Chrome và chạy lại script. Không dùng page.reload() để tránh giữ
- * trạng thái lỗi của video/menu Share hiện tại.
- */
-async function restartScript(context) {
-  console.log('\n🔄 [TỰ ĐỘNG RESTART] Không có nút Copy hoặc link không đúng định dạng.');
-  console.log('🔄 Đang đóng Chrome và khởi động lại tiktok_watch.js...');
-  await context.close().catch(() => {});
-
-  const child = spawn(process.execPath, process.argv.slice(1), {
-    cwd: process.cwd(),
-    env: process.env,
-    stdio: 'inherit'
-  });
-  child.unref();
-  process.exit(0);
-}
-
-/**
  * Cuộn xuống video tiếp theo
  */
 async function scrollToNextVideo(page) {
@@ -716,6 +703,9 @@ async function scrollToNextVideo(page) {
 }
 
 async function main() {
+  // Chỉ để 1 bản tiktok_watch chạy: dừng các bản cũ (kể cả bản chạy ngầm) và Chrome của hồ sơ TikTok
+  killPreviousInstances({ script: 'tiktok_watch.js', profilePattern: /^user_data_tiktok$/, label: 'tiktok_watch' });
+
   console.log('====================================================');
   console.log('🚀 TỰ ĐỘNG XEM, THẢ TIM, COPY LINK & LƯỚT TIKTOK');
   console.log('====================================================');
@@ -725,110 +715,129 @@ async function main() {
     console.log('💡 Đang chạy ở chế độ ẩn cửa sổ: Tiến trình sẽ in trực tiếp tại đây. Bấm Ctrl + C để dừng.');
   }
 
-  const { context, page } = await launchTikTok({ headless: CONFIG.headless });
-  await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
-
-  // Cài hook bắt link ngay từ khi trang bắt đầu tải
-  await page.addInitScript(() => {
-    window.__capturedTikTokLink = '';
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
-      navigator.clipboard.writeText = async (text) => {
-        if (text) window.__capturedTikTokLink = text;
-        return origWrite(text).catch(() => {});
-      };
-    }
-    if (document.execCommand) {
-      const origExec = document.execCommand.bind(document);
-      document.execCommand = function(cmd, ...args) {
-        if (cmd === 'copy') {
-          const sel = window.getSelection()?.toString();
-          if (sel && sel.includes('tiktok.com')) window.__capturedTikTokLink = sel;
-          const el = document.activeElement;
-          if (el && (el.value || el.innerText)) {
-            const val = el.value || el.innerText;
-            if (val && val.includes('tiktok.com')) window.__capturedTikTokLink = val;
-          }
-        }
-        return origExec(cmd, ...args);
-      };
-    }
-    document.addEventListener('copy', (e) => {
-      try {
-        if (e.clipboardData && e.clipboardData.setData) {
-          const origSet = e.clipboardData.setData.bind(e.clipboardData);
-          e.clipboardData.setData = function(type, val) {
-            if (val && typeof val === 'string' && val.includes('tiktok.com')) {
-              window.__capturedTikTokLink = val;
-            }
-            return origSet(type, val);
-          };
-        }
-        const text = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString();
-        if (text && text.includes('tiktok.com')) window.__capturedTikTokLink = text;
-      } catch (_) {}
-    }, true);
-  }).catch(() => {});
-
-  let isClosed = false;
+  // Dừng hẳn khi bấm Ctrl + C. Restart tự động chạy lại trong cùng tiến trình này
+  // (không spawn tiến trình mới) nên Ctrl + C luôn dừng được script.
+  let context = null;
+  let stopping = false;
   const cleanup = async () => {
-    if (isClosed) return;
-    isClosed = true;
+    if (stopping) return;
+    stopping = true;
     console.log('\n👋 Đang đóng trình duyệt chạy ngầm và dừng chương trình...');
-    await context.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
     process.exit(0);
   };
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
 
-  context.on('close', () => {
-    isClosed = true;
-    console.log('\n👋 Trình duyệt đã được đóng. Dừng chương trình.');
-  });
+  let count = 0;
+  while (!stopping) {
+    const session = await launchTikTok({ headless: CONFIG.headless });
+    context = session.context;
+    const page = session.page;
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
 
-  try {
-    console.log(`🌍 Đang truy cập: ${TIKTOK_FEED_URL}...`);
-    await page.goto(TIKTOK_FEED_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(4000);
+    // Cài hook bắt link ngay từ khi trang bắt đầu tải
+    await page.addInitScript(() => {
+      window.__capturedTikTokLink = '';
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+        navigator.clipboard.writeText = async (text) => {
+          if (text) window.__capturedTikTokLink = text;
+          return origWrite(text).catch(() => {});
+        };
+      }
+      if (document.execCommand) {
+        const origExec = document.execCommand.bind(document);
+        document.execCommand = function(cmd, ...args) {
+          if (cmd === 'copy') {
+            const sel = window.getSelection()?.toString();
+            if (sel && sel.includes('tiktok.com')) window.__capturedTikTokLink = sel;
+            const el = document.activeElement;
+            if (el && (el.value || el.innerText)) {
+              const val = el.value || el.innerText;
+              if (val && val.includes('tiktok.com')) window.__capturedTikTokLink = val;
+            }
+          }
+          return origExec(cmd, ...args);
+        };
+      }
+      document.addEventListener('copy', (e) => {
+        try {
+          if (e.clipboardData && e.clipboardData.setData) {
+            const origSet = e.clipboardData.setData.bind(e.clipboardData);
+            e.clipboardData.setData = function(type, val) {
+              if (val && typeof val === 'string' && val.includes('tiktok.com')) {
+                window.__capturedTikTokLink = val;
+              }
+              return origSet(type, val);
+            };
+          }
+          const text = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString();
+          if (text && text.includes('tiktok.com')) window.__capturedTikTokLink = text;
+        } catch (_) {}
+      }, true);
+    }).catch(() => {});
 
-    const loggedIn = await isTikTokLoggedIn(context, page);
-    if (loggedIn) {
-      console.log('✅ Đã nhận diện phiên đăng nhập TikTok!');
-    } else {
-      console.log('ℹ️ Đang chạy với tài khoản hiện tại (nếu chưa đăng nhập, bạn có thể tự đăng nhập trên cửa sổ này).');
-    }
+    let browserClosed = false;
+    let restartReason = '';
+    context.on('close', () => {
+      browserClosed = true;
+      if (!stopping && !restartReason) console.log('\n👋 Trình duyệt đã được đóng. Dừng chương trình.');
+    });
 
-    // Tắt các popup mở đầu
-    await dismissPopups(page);
+    try {
+      console.log(`🌍 Đang truy cập: ${TIKTOK_FEED_URL}...`);
+      await page.goto(TIKTOK_FEED_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(4000);
 
-    // Bắt đầu vòng lặp lướt video
-    let count = 0;
-    while (!isClosed) {
-      count++;
-      if (CONFIG.maxVideos > 0 && count > CONFIG.maxVideos) {
-        console.log(`\n🎉 Đã hoàn thành xem ${CONFIG.maxVideos} video theo cấu hình!`);
-        break;
+      const loggedIn = await isTikTokLoggedIn(context, page);
+      if (loggedIn) {
+        console.log('✅ Đã nhận diện phiên đăng nhập TikTok!');
+      } else {
+        console.log('ℹ️ Đang chạy với tài khoản hiện tại (nếu chưa đăng nhập, bạn có thể tự đăng nhập trên cửa sổ này).');
       }
 
-      const result = await watchCurrentVideo(page, count);
+      // Tắt các popup mở đầu
+      await dismissPopups(page);
 
-      if (isClosed) break;
+      // Bắt đầu vòng lặp lướt video
+      while (!stopping && !browserClosed) {
+        count++;
+        if (CONFIG.maxVideos > 0 && count > CONFIG.maxVideos) {
+          console.log(`\n🎉 Đã hoàn thành xem ${CONFIG.maxVideos} video theo cấu hình!`);
+          break;
+        }
 
-      if (result && result.restartRequired) {
-        await restartScript(context);
-        return;
+        const result = await watchCurrentVideo(page, count);
+
+        if (stopping || browserClosed) break;
+
+        if (result && result.restartRequired) {
+          restartReason = 'Không có nút Copy hoặc link không đúng định dạng.';
+          break;
+        }
+
+        if (CONFIG.recycleEvery > 0 && count % CONFIG.recycleEvery === 0) {
+          restartReason = `Đã xem ${count} video, mở lại Chrome để giải phóng RAM.`;
+          break;
+        }
+
+        await scrollToNextVideo(page);
       }
+    } catch (error) {
+      if (!stopping && !browserClosed) {
+        console.error('❌ Lỗi:', error.message);
+      }
+    }
 
-      await scrollToNextVideo(page);
-    }
-  } catch (error) {
-    if (!isClosed) {
-      console.error('❌ Lỗi:', error.message);
-    }
-  } finally {
-    if (!isClosed) {
-      await context.close().catch(() => {});
-    }
+    if (stopping) return;
+    await context.close().catch(() => {});
+    if (!restartReason) break;
+
+    // Đóng hẳn Chrome rồi mở lại. Không dùng page.reload() để tránh giữ
+    // trạng thái lỗi của video/menu Share hiện tại, và để trả lại toàn bộ RAM của Chrome.
+    console.log(`\n🔄 [TỰ ĐỘNG RESTART] ${restartReason}`);
+    console.log('🔄 Đang đóng Chrome và khởi động lại...');
   }
 }
 

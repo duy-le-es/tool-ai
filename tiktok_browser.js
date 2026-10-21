@@ -1,6 +1,7 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const { trimProfileCache } = require('./profile_cache');
 require('dotenv').config();
 
 const TIKTOK_STUDIO_URL = process.env.TIKTOK_STUDIO_URL || 'https://www.tiktok.com/tiktokstudio/content';
@@ -26,6 +27,8 @@ function cleanStaleLocks(dir) {
 // Dùng Google Chrome thật (channel "chrome") — TikTok dễ chặn Chromium của Playwright
 // và Chromium không phát được MP4 khi xem trước video lúc upload.
 async function launchTikTok({ headless = false } = {}) {
+  // TikTok lưu thêm dữ liệu video vào IndexedDB, không bị --disk-cache-size giới hạn
+  trimProfileCache(TIKTOK_USER_DATA_DIR, { extraDirs: ['Default/IndexedDB'] });
   cleanStaleLocks(TIKTOK_USER_DATA_DIR);
 
   const context = await chromium.launchPersistentContext(TIKTOK_USER_DATA_DIR, {

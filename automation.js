@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { installCaptureHooks, waitAndCollectResults } = require('./results');
+const { trimProfileCache } = require('./profile_cache');
 require('dotenv').config();
 
 const FLOW_TOOL_URL = process.env.FLOW_TOOL_URL || 'https://flow.google.com/project/856dd52d-7081-4b09-8a04-b32e7b5b6a0d/tool/0f719f8f-3aa3-4c8a-8b73-edb5ecd9fa7b';
@@ -57,14 +58,18 @@ async function describeSearch(page, texts) {
   return lines.join('\n');
 }
 
-async function findInFrames(page, texts, { timeout = 30000 } = {}) {
+// buttonsOnly: chỉ nhận <button>/[role=button] chứa chữ. Dùng cho CTA có chữ trùng với
+// tiêu đề khác trong applet (vd phụ đề "SẢN XUẤT VIDEO 16S HOÀN CHỈNH • ..." ở đầu trang).
+async function findInFrames(page, texts, { timeout = 30000, buttonsOnly = false } = {}) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (!(await isAppletLoading(page))) {
       const frames = [...page.frames().filter((f) => f !== page.mainFrame()), page.mainFrame()];
       for (const frame of frames) {
         for (const text of texts) {
-          const loc = frame.getByText(text).first();
+          const loc = buttonsOnly
+            ? frame.locator('button, [role="button"]').filter({ hasText: text }).first()
+            : frame.getByText(text).first();
           try {
             if (await loc.isVisible() && await isClickable(loc)) return loc;
           } catch (_) {}
@@ -101,7 +106,9 @@ async function productionUiState(page, control) {
 
   // Những nhãn này chỉ xuất hiện sau khi CTA đã được Flow nhận và bắt đầu đổi
   // sang màn hình/trạng thái sản xuất. Dò ở mọi frame vì Flow có thể thay iframe.
-  const startedLabels = /^(đang sản xuất|đang tạo video|đang render|đang xử lý|tạo video|xem kết quả|tải ngay|download video)$/i;
+  // Không dùng "Kịch bản / Phân cảnh / Kết quả": đó là nhãn của thanh bước luôn
+  // hiển thị trên đầu applet, dùng chúng sẽ xác nhận sai ngay cả khi click bị bỏ qua.
+  const startedLabels = /^(đang sản xuất|đang tạo video|đang render|đang xử lý|xem kết quả|tải ngay|download video)$/i;
   let startedLabel = '';
   for (const frame of page.frames()) {
     const label = frame.getByText(startedLabels).first();
@@ -121,6 +128,9 @@ const PRODUCTION_ERROR_RE = /(lỗi|error|thất bại|failed|không thể|khôn
 // Trang kết quả có các mục cam kết như "KHÔNG VI PHẠM NHÃN HIỆU ✓" hay
 // "...bảo vệ tài khoản khỏi quét vi phạm..." -> không phải lỗi.
 const PRODUCTION_SAFE_RE = /(✓|✔|không vi phạm|an toàn|bảo vệ|không in logo|không dính)/i;
+// Icon Material của applet là chữ "error_outline", "warning", "sync"... hiển thị bằng font,
+// innerText vẫn đọc ra tên icon -> không phải thông báo lỗi (thông báo thật luôn có dấu cách/chữ hoa/dấu).
+const ICON_NAME_RE = /^[a-z][a-z0-9_]*$/;
 
 async function appletTextLines(page) {
   const lines = new Set();
@@ -140,7 +150,7 @@ async function newAppletLines(page, baseline) {
 
 // Trả về thông báo lỗi mới xuất hiện (nếu có) và chụp lại khung lỗi.
 async function detectProductionError(page, baseline, screenshotsDir) {
-  const errors = (await newAppletLines(page, baseline)).filter((line) => PRODUCTION_ERROR_RE.test(line) && !PRODUCTION_SAFE_RE.test(line));
+  const errors = (await newAppletLines(page, baseline)).filter((line) => PRODUCTION_ERROR_RE.test(line) && !PRODUCTION_SAFE_RE.test(line) && !ICON_NAME_RE.test(line));
   if (errors.length === 0) return null;
   for (const frame of page.frames()) {
     const loc = frame.getByText(errors[0], { exact: true }).first();
@@ -196,16 +206,30 @@ async function clickAndConfirmProduction(page, produceBtn, screenshotsDir, timeo
     if (err) throw new Error(`Flow báo lỗi sau khi bấm "SẢN XUẤT VIDEO": ${err.message} (xem ${err.screenshotPath})`);
   };
 
+  // Chữ tiến trình mới xuất hiện sau khi bấm (vd "Đang soạn kịch bản...") cũng là tín hiệu Flow đã nhận lệnh.
+  const progressLine = /^đang\s|đang (soạn|tạo|sản xuất|xử lý|render|phân tích|dựng)/i;
   const deadline = Date.now() + timeout;
+  const fallbackClickAt = Date.now() + 8000;
+  let fallbackClicked = false;
   let current = before;
   let confirmed = false;
   while (Date.now() < deadline) {
     await failIfError();
     current = await productionUiState(page, control);
-    if (!current.connected || !current.visible || current.disabled || current.startedLabel) {
-      console.error(`✅ Flow đã nhận lệnh sản xuất${current.startedLabel ? ` (${current.startedLabel})` : ''}`);
+    // Nhãn đã có sẵn trước khi bấm không chứng minh được gì.
+    const newLabel = current.startedLabel && !baseline.has(current.startedLabel) ? current.startedLabel : '';
+    const progress = newLabel ? '' : (await newAppletLines(page, baseline)).find((line) => progressLine.test(line)) || '';
+    if (!current.connected || !current.visible || current.disabled || newLabel || progress) {
+      const signal = newLabel || progress;
+      console.error(`✅ Flow đã nhận lệnh sản xuất${signal ? ` (${signal})` : ''}`);
       confirmed = true;
       break;
+    }
+    // Click chuột thật đôi khi bị applet bỏ qua (vd đang re-render) -> thử click DOM một lần.
+    if (!fallbackClicked && Date.now() > fallbackClickAt) {
+      fallbackClicked = true;
+      console.warn('⚠️ Flow chưa phản hồi sau 8 giây, bấm lại nút "SẢN XUẤT VIDEO" bằng DOM click...');
+      await control.evaluate((el) => el.click()).catch(() => {});
     }
     await page.waitForTimeout(250);
   }
@@ -230,6 +254,36 @@ async function clickAndConfirmProduction(page, produceBtn, screenshotsDir, timeo
   const added = await newAppletLines(page, baseline);
   if (added.length) console.error(`ℹ️ Chữ mới trên UI sau khi bấm: ${added.slice(0, 10).join(' | ')}`);
   return { checkError: failIfError };
+}
+
+// "GỢI Ý KỊCH BẢN" ghi kịch bản vào ô mô tả theo kiểu stream. Bấm "SẢN XUẤT VIDEO"
+// khi chữ vẫn đang chạy có thể bị applet bỏ qua -> đợi tới khi nội dung đứng yên.
+async function waitForScriptStable(page, { timeout = 90000, quietMs = 3000 } = {}) {
+  const readScript = async () => {
+    for (const frame of [...page.frames().filter((f) => f !== page.mainFrame()), page.mainFrame()]) {
+      const value = await frame.evaluate(() => [...document.querySelectorAll('textarea')]
+        .filter((el) => el.getBoundingClientRect().height > 0)
+        .map((el) => el.value)
+        .join('\n')).catch(() => '');
+      if (value) return value;
+    }
+    return '';
+  };
+  const deadline = Date.now() + timeout;
+  let last = await readScript();
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    const value = await readScript();
+    if (value !== last) {
+      last = value;
+      stableSince = Date.now();
+    } else if (value && Date.now() - stableSince >= quietMs) {
+      console.error(`📝 Kịch bản đã điền xong (${value.length} ký tự)`);
+      return;
+    }
+  }
+  console.warn('⚠️ Ô mô tả vẫn đang thay đổi / trống sau khi bấm gợi ý kịch bản; vẫn tiếp tục.');
 }
 
 // UI mới hiển thị "BỘ SƯU TẬP SẢN PHẨM (n/3)". Đây là nguồn xác nhận duy nhất
@@ -393,15 +447,60 @@ function flowPageClosedError(page) {
 }
 
 const FLOW_STYLE_LABELS = {
-  cinematic: ['ĐIỆN ẢNH / SẢN PHẨM', 'Điện ảnh / Sản phẩm', 'ĐIỆN ẢNH'],
-  viral: ['VIRAL / SỐNG ĐỘNG', 'Viral / Sống động', 'VIRAL'],
+  cinematic: ['ĐIỆN ẢNH / SANG TRỌNG', 'Điện ảnh / Sang trọng', 'ĐIỆN ẢNH / SẢN PHẨM', 'Điện ảnh / Sản phẩm', 'ĐIỆN ẢNH'],
+  viral: ['VIRAL / SÔI ĐỘNG', 'Viral / Sôi động', 'VIRAL / SỐNG ĐỘNG', 'Viral / Sống động', 'VIRAL'],
   chill: ['CHILL / NHẸ NHÀNG', 'Chill / Nhẹ nhàng', 'CHILL'],
   funny: ['HÀI HƯỚC / TRẺ TRUNG', 'Hài hước / Trẻ trung', 'HÀI HƯỚC']
 };
 
+const FLOW_DURATION_LABELS = {
+  '16s': ['16s (Mặc định - Chuẩn TikTok Viral)', '16s (Mặc định', '16s'],
+  '10s': ['10s (Bản rút gọn)', '10s'],
+  '20s': ['20s (2 phân đoạn 10s)', '20s (2 phân đoạn)', '20s'],
+  '26s': ['26s (Video dài chi tiết)', '26s']
+};
+
+async function selectFlowDuration(page, durationKey = '20s') {
+  if (!FLOW_DURATION_LABELS[durationKey]) durationKey = '20s';
+  const targetLabels = FLOW_DURATION_LABELS[durationKey];
+
+  // Tìm nút dropdown thời lượng hiện tại (nằm trong applet, có chữ 10s, 16s, 20s hoặc 26s)
+  const durationTrigger = await findInFrames(page, [
+    /^(10s|16s|20s|26s)\b/i,
+    '20s (2 phân đoạn',
+    '16s (Mặc định'
+  ], { timeout: 4000 });
+
+  if (!durationTrigger) {
+    console.warn('⚠️ Không tìm thấy nút dropdown "THỜI LƯỢNG" trên Flow; bỏ qua bước chọn thời lượng.');
+    return;
+  }
+
+  const currentText = (await durationTrigger.textContent().catch(() => '')).trim();
+  if (currentText.toLowerCase().startsWith(durationKey.toLowerCase())) {
+    console.error(`⏱️ Thời lượng Flow đã ở mức: ${durationKey} ("${currentText}")`);
+    return;
+  }
+
+  console.error(`⏱️ Đang đổi thời lượng từ "${currentText}" sang ${durationKey}...`);
+  await durationTrigger.click();
+  await page.waitForTimeout(600);
+
+  // Tìm option trong menu popup vừa mở
+  const optionBtn = await findInFrames(page, targetLabels, { timeout: 4000 });
+  if (optionBtn) {
+    await optionBtn.click();
+    await page.waitForTimeout(600);
+    console.error(`✅ Đã chọn thời lượng: ${durationKey}`);
+  } else {
+    console.warn(`⚠️ Không thấy lựa chọn thời lượng "${durationKey}" trong dropdown; đóng menu.`);
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+}
+
 // imagePaths: 1 đường dẫn hoặc mảng nhiều ảnh — tất cả thuộc CÙNG MỘT sản phẩm, chạy trong 1 flow duy nhất
 // userDataDir / flowUrl: hồ sơ Chrome + link tool Flow của tài khoản Google được chọn (xem accounts.js)
-async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDataDir = USER_DATA_DIR, flowUrl = FLOW_TOOL_URL, videoStyle = 'cinematic' } = {}) {
+async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDataDir = USER_DATA_DIR, flowUrl = FLOW_TOOL_URL, videoStyle = 'cinematic', videoDuration = '20s' } = {}) {
   imagePaths = Array.isArray(imagePaths) ? imagePaths : [imagePaths];
   if (imagePaths.length === 0) throw new Error('Không có ảnh sản phẩm nào');
   for (const imagePath of imagePaths) {
@@ -417,6 +516,7 @@ async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDat
 
   console.error('🚀 Khởi động trình duyệt...');
   console.error(`👤 Hồ sơ Chrome: ${userDataDir}`);
+  trimProfileCache(userDataDir);
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: HEADLESS,
     args: [
@@ -427,19 +527,25 @@ async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDat
       // làm Flow chạy chậm / treo. Tắt các cơ chế giảm tốc này để bot chạy 24/7 ổn định.
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
-      '--disable-background-timer-throttling'
+      '--disable-background-timer-throttling',
+      // Giới hạn cache (150 MB / 32 MB media): mặc định Chrome để cache lớn theo dung lượng ổ trống,
+      // video Flow tạo ra bị cache lại làm hồ sơ user_data phình rất nhanh.
+      '--disk-cache-size=157286400',
+      '--media-cache-size=33554432'
     ],
     viewport: { width: 1440, height: 900 }
   });
 
   // Không tái sử dụng tab Flow từ phiên trước: popup, iframe hoặc trạng thái lỗi cũ
   // có thể còn giữ lại trong tab Chrome persistent. Cookie đăng nhập vẫn được giữ nguyên.
+  // Mở tab mới TRƯỚC rồi mới đóng tab cũ: đóng hết tab sẽ đóng luôn cửa sổ Chrome cuối cùng,
+  // newPage() chạy đúng lúc cửa sổ đang đóng sẽ lỗi "Target.createTarget: Failed to open a new tab".
   const stalePages = context.pages();
+  const page = await context.newPage();
   if (stalePages.length) {
     console.error(`🧹 Đang đóng ${stalePages.length} tab cũ của Google Flow...`);
     await Promise.all(stalePages.map((stalePage) => stalePage.close().catch(() => {})));
   }
-  const page = await context.newPage();
   // Ghi lại lý do nếu trình duyệt / trang bị đóng giữa chừng để báo lỗi rõ ràng
   let closingByBot = false;
   page.on('crash', () => {
@@ -520,16 +626,8 @@ async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDat
       }
     }
 
-    // UI mới dùng "TỰ ĐỘNG ĐIỀN TỪ ẢNH"; các nhãn Magic Fill được giữ để
-    // không làm hỏng tool Flow của những tài khoản chưa nhận UI mới.
-    const magicFillBtn = await findInFrames(page, [
-      'TỰ ĐỘNG ĐIỀN TỪ ẢNH', 'Tự động điền từ ảnh', 'MAGIC FILL AI', 'MAGIC FILL'
-    ], { timeout: 5000 });
-    if (magicFillBtn) {
-      console.error('✨ Đang bấm nút "TỰ ĐỘNG ĐIỀN TỪ ẢNH"...');
-      await magicFillBtn.click();
-      await page.waitForTimeout(4000);
-    }
+    // Chọn thời lượng video đã được chọn trên Telegram (mặc định 20s).
+    await selectFlowDuration(page, videoDuration);
 
     // Chọn mood đã được người dùng chọn trên Telegram. Bỏ qua khi Flow chưa
     // hiện nhóm nút này để vẫn tương thích với giao diện cũ.
@@ -543,9 +641,38 @@ async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDat
       console.warn(`⚠️ Không thấy nút phong cách "${videoStyle}" trên Flow; dùng lựa chọn mặc định của giao diện.`);
     }
 
-    // UI hiện tại dùng "SẢN XUẤT VIDEO". Các nhãn cũ chỉ là dự phòng cho
-    // tool Flow chưa được cập nhật, không phải CTA ưu tiên.
+    // UI mới dùng "GỢI Ý KỊCH BẢN" (hoặc kèm số giây 20S/16S/10S/26S) hoặc "TỰ ĐỘNG ĐIỀN TỪ ẢNH";
+    // các nhãn Magic Fill cũ được giữ để tương thích với các phiên bản giao diện khác.
+    const magicFillBtn = await findInFrames(page, [
+      /GỢI Ý KỊCH BẢN/i,
+      'GỢI Ý KỊCH BẢN 20S', 'Gợi ý kịch bản 20s',
+      'GỢI Ý KỊCH BẢN 16S', 'Gợi ý kịch bản 16s',
+      'GỢI Ý KỊCH BẢN 10S', 'Gợi ý kịch bản 10s',
+      'GỢI Ý KỊCH BẢN 26S', 'Gợi ý kịch bản 26s',
+      'GỢI Ý KỊCH BẢN', 'Gợi ý kịch bản',
+      'TỰ ĐỘNG ĐIỀN TỪ ẢNH', 'Tự động điền từ ảnh', 'MAGIC FILL AI', 'MAGIC FILL'
+    ], { timeout: 5000 });
+    if (magicFillBtn) {
+      console.error('✨ Đang bấm nút gợi ý kịch bản / điền từ ảnh...');
+      await magicFillBtn.click();
+      await page.waitForTimeout(2000);
+      await waitForScriptStable(page);
+    }
+
+    // UI hiện tại dùng "SẢN XUẤT VIDEO" (hoặc kèm số giây 20S/16S/10S/26S).
+    // Các nhãn cũ chỉ là dự phòng cho tool Flow chưa được cập nhật, không phải CTA ưu tiên.
     const produceButtonLabels = [
+      /SẢN XUẤT VIDEO/i,
+      'SẢN XUẤT VIDEO 20S (CÙNG MAI ANH)',
+      'Sản xuất video 20s (cùng Mai Anh)',
+      'SẢN XUẤT VIDEO 16S (CÙNG MAI ANH)',
+      'SẢN XUẤT VIDEO 10S (CÙNG MAI ANH)',
+      'SẢN XUẤT VIDEO 26S (CÙNG MAI ANH)',
+      'SẢN XUẤT VIDEO 20S',
+      'Sản xuất video 20s',
+      'SẢN XUẤT VIDEO 16S',
+      'SẢN XUẤT VIDEO 10S',
+      'SẢN XUẤT VIDEO 26S',
       'SẢN XUẤT VIDEO',
       'Sản xuất video',
       'SO SÁNH MẪU & SẢN XUẤT AN TOÀN',
@@ -554,7 +681,7 @@ async function runAutomationAttempt(imagePaths, { onProgress = () => {}, userDat
       'Sản xuất tự động'
     ];
     console.error('🎬 Đang tìm nút "SẢN XUẤT VIDEO"...');
-    const produceBtn = await findInFrames(page, produceButtonLabels);
+    const produceBtn = await findInFrames(page, produceButtonLabels, { buttonsOnly: true });
     if (!produceBtn) {
       throw new Error('Không tìm thấy nút "SẢN XUẤT VIDEO" trong applet');
     }

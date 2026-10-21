@@ -1,0 +1,5 @@
+node -e "
+const { trimProfileCache } = require('./profile_cache');
+for (const d of ['user_data','user_data_2','user_data_3','user_data_4']) trimProfileCache(d, { limitMb: 0 });
+trimProfileCache('user_data_tiktok', { limitMb: 0, extraDirs: ['Default/IndexedDB'] });
+"
